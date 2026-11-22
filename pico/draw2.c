@@ -57,6 +57,75 @@ void DrawSpriteFull(unsigned int *sprite, struct PicoEState *est);
 #else
 
 
+#if defined(N64) && !INTERLACE
+/* N64 (big-endian MIPS III, 64-bit registers): draw a whole 8-pixel tile row
+ * with 64-bit SWAR instead of 8 test-and-store byte writes.  A VRAM tile row
+ * is one 32-bit word, pixels p0..p7 from the top nibble down.  spread8()
+ * turns it into 8 bytes p0..p7; the transparency mask (0xFF where p != 0)
+ * selects which destination bytes change, via one unaligned 64-bit
+ * read-modify-write (ldl/ldr, sdl/sdr), or a plain store if the row is
+ * fully opaque.  Produces exactly the same bytes as the generic version. */
+typedef unsigned long long u64_t;
+
+static inline u64_t spread8(u32 w)
+{
+	u64_t x = w;
+	x = ((x << 16) | x) & 0x0000FFFF0000FFFFULL;
+	x = ((x <<  8) | x) & 0x00FF00FF00FF00FFULL;
+	x = ((x <<  4) | x) & 0x0F0F0F0F0F0F0F0FULL;
+	return x;
+}
+
+static inline u32 nibrev32(u32 w)  /* p0..p7 -> p7..p0 */
+{
+	w = (w >> 16) | (w << 16);
+	w = ((w >> 8) & 0x00FF00FF) | ((w << 8) & 0xFF00FF00);
+	w = ((w >> 4) & 0x0F0F0F0F) | ((w << 4) & 0xF0F0F0F0);
+	return w;
+}
+
+static inline void put8(unsigned char *pd, u64_t x, u64_t pal8)
+{
+	u64_t nz = (x | (x >> 1) | (x >> 2) | (x >> 3)) & 0x0101010101010101ULL;
+	u64_t m = (nz << 8) - nz;   /* 0xFF per non-transparent pixel */
+	u64_t src = x | pal8, d;
+	if (m == ~0ULL) {
+		__builtin_memcpy(pd, &src, 8);
+		return;
+	}
+	__builtin_memcpy(&d, pd, 8);
+	d = (d & ~m) | (src & m);
+	__builtin_memcpy(pd, &d, 8);
+}
+
+/* flip: 0 normal, 1 X flip; ystep: +2 normal, -2 Y flip (addr preset) */
+static inline int TileRowsN64(unsigned char *pd, int addr, unsigned char pal,
+			      struct PicoEState *est, int xflip, int ystep)
+{
+	const unsigned short *vram = est->PicoMem_vram;
+	u64_t pal8 = (u64_t)pal * 0x0101010101010101ULL;
+	int i, stride = est->Draw2Width, blank = 1;
+
+	for (i = 8; i; i--, addr += ystep, pd += stride) {
+		u32 w = *(const u32 *)(vram + addr);
+		if (!w) continue;
+		if (xflip) w = nibrev32(w);
+		put8(pd, spread8(w), pal8);
+		blank = 0;
+	}
+	return blank;
+}
+
+static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
+{ return TileRowsN64(pd, addr, pal, est, 0, 2); }
+static int TileXflipYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
+{ return TileRowsN64(pd, addr, pal, est, 1, 2); }
+static int TileXnormYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
+{ return TileRowsN64(pd, addr + 14, pal, est, 0, -2); }
+static int TileXflipYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
+{ return TileRowsN64(pd, addr + 14, pal, est, 1, -2); }
+
+#else
 static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
 {
 	unsigned int pack=0; unsigned int t=0, blank = 1;
@@ -164,6 +233,7 @@ static int TileXflipYflip(unsigned char *pd,int addr,unsigned char pal, struct P
 	}
 	return blank; // Tile blank?
 }
+#endif /* N64 SWAR tile rows */
 
 
 // start: (tile_start<<16)|row_start, end: [same]
@@ -578,6 +648,30 @@ static void BackFillFull(unsigned char *dst, int reg7, int lwidth)
 {
 	unsigned int back;
 	int i;
+
+#ifdef N64
+	/* The fill covers the whole render area, which is 8x the 8KB
+	 * direct-mapped D-cache: every line it touches is a write miss, and a
+	 * plain store miss first READS the old line from RDRAM, only to
+	 * overwrite all of it.  CACHE 0x0D (Create Dirty Exclusive) claims the
+	 * line without that read.  It is only safe when every byte of each
+	 * claimed 16-byte line is then written, so fill the 224 rows as one
+	 * contiguous block, left margins included (margins are never
+	 * displayed and tiles overdraw them anyway). */
+	{
+		unsigned char *p = dst + 8*lwidth, *end = p + (END_ROW-START_ROW)*8*lwidth;
+		if (((((uintptr_t)p) | ((uintptr_t)end)) & 15) == 0 &&
+		    ((uintptr_t)p >> 29) == 4) {   /* cached KSEG0 only */
+			unsigned long long b8 = (reg7 & 0x3f) * 0x0101010101010101ULL;
+			for (; p < end; p += 16) {
+				__asm__ volatile ("cache 0x0d, 0(%0)" :: "r"(p) : "memory");
+				((unsigned long long *)p)[0] = b8;
+				((unsigned long long *)p)[1] = b8;
+			}
+			return;
+		}
+	}
+#endif
 
 	// Start with a background color:
 	back=reg7&0x3f;

@@ -154,6 +154,7 @@ static void write_sound(int len)
 #endif
 
 uint32_t bench_audio_hash = 2166136261u; unsigned int bench_audio_n;
+uint32_t bench_fb_hash = 2166136261u; unsigned int bench_fb_n;
 unsigned int bench_z80_ticks, bench_z80_calls, bench_fmwait_ticks, bench_blitwait_ticks, bench_fmwait_skip;
 
 static unsigned int bench_pad(unsigned int f)
@@ -713,6 +714,16 @@ int main(int argc, char *argv[])
 					update_palette();
 				}
 
+#ifdef BENCH_FBHASH
+				{   /* verification builds: hash every rendered frame's visible pixels */
+					extern uint32_t bench_fb_hash; extern unsigned int bench_fb_n;
+					const uint8_t *row = screen_buffer + 8*SCR_PITCH + 8;
+					for (int yy = 0; yy < h; yy++, row += SCR_PITCH)
+						for (int xx = 0; xx < w; xx++)
+							bench_fb_hash = (bench_fb_hash ^ row[xx]) * 16777619u;
+					bench_fb_n++;
+				}
+#endif
 				unsigned wb_bytes = (SCR_PITCH * h + 15) & ~15;
 				data_cache_hit_writeback(screen_buffer, wb_bytes);
 				data_cache_hit_writeback(pal_rgba5551, sizeof(pal_rgba5551));
@@ -806,8 +817,8 @@ post_render: ;
 				memset(z80_pchist, 0, sizeof(z80_pchist));
 #endif
 			if (f == BENCH_END || f == BENCH_END + 1)
-				debugf("[AUDIO] f=%u samples=%u hash=%08lx\n", f, bench_audio_n,
-				       (unsigned long)bench_audio_hash);
+				debugf("[AUDIO] f=%u samples=%u hash=%08lx fbframes=%u fbhash=%08lx\n", f, bench_audio_n,
+				       (unsigned long)bench_audio_hash, bench_fb_n, (unsigned long)bench_fb_hash);
 			if (f == BENCH_END) {
 #ifdef N64_PROF_SAMPLE
 				ps_stop_and_dump();

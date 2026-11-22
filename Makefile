@@ -282,6 +282,14 @@ LDFLAGS += -Wl,--defsym=rsp_fm_meta_start=0,--defsym=rsp_fm_meta_end=0
 # collide at link.  Allow the duplicates; they're functionally
 # identical implementations of the newlib retarget interface.
 LDFLAGS += -Wl,-z,muldefs
+# Profile-guided function order: hottest functions first in .text (see
+# platform/n64/tools/make_ordering.py).  Packs the hot set together for the
+# 16KB direct-mapped I-cache and keeps its layout stable across unrelated
+# code changes.  Disable with N64_HOT_ORDER=0.
+N64_HOT_ORDER ?= 1
+ifeq "$(N64_HOT_ORDER)" "1"
+LDFLAGS += -Wl,--section-ordering-file=platform/n64/hot_functions.ld
+endif
 # Disable features that won't fit in N64 RAM
 no_32x = 1
 no_sms = 0
