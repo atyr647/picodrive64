@@ -13,6 +13,12 @@
 
 /* Per-frame profiling counters (read by main_n64.c) */
 #ifdef N64
+#include "../platform/n64/emux.h"
+#else
+#define EMUX_START(s)
+#define EMUX_STOP(s)
+#endif
+#ifdef N64
 #include <libdragon.h>
 extern unsigned int prof_68k_ticks;
 extern unsigned int prof_vdp_ticks;
@@ -126,7 +132,9 @@ static __inline void SekRunM68k(int cyc)
 {
   // TODO 0x100 would be 2 cycles/128, moreover far too sensitive
   SekAimM68k(cyc, 0x108); // OutRunners, testpico, VDPFIFOTesting
+  EMUX_START(1);
   SekSyncM68k(0);
+  EMUX_STOP(1);
 }
 
 static void SyncCPUs(unsigned int cycles)
@@ -222,7 +230,7 @@ static int PicoFrameHints(void)
       // find the right moment for frame renderer, when display is no longer blanked
       if ((pv->reg[1]&0x40) || y > 100) {
         if (Pico.est.rendstatus & PDRAW_SYNC_NEEDED) {
-          PROF_START();
+          PROF_START(); EMUX_START(3);
 #ifdef N64
           extern int n64_use_rdp_tiles;
           extern void PicoFrameFullRDP(void);
@@ -233,7 +241,7 @@ static int PicoFrameHints(void)
 #else
           PicoFrameFull();
 #endif
-          PROF_VDP();
+          EMUX_STOP(3); PROF_VDP();
         }
 #ifdef DRAW_FINISH_FUNC
         DRAW_FINISH_FUNC();
@@ -414,7 +422,9 @@ static int PicoFrameHints(void)
 #endif
 
   // get samples from sound chips
+  EMUX_START(4);
   PsndGetSamples(y);
+  EMUX_STOP(4);
 
   timers_cycle(cycles_68k_to_z80(Pico.t.m68c_aim - Pico.t.m68c_frame_start));
   z80_resetCycles();

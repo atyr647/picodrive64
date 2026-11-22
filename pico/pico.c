@@ -283,7 +283,9 @@ PICO_INTERNAL void PicoSyncZ80(unsigned int m68k_cycles_done)
     extern unsigned int bench_z80_ticks, bench_z80_calls;
     unsigned int _bt = timer_ticks();
 #endif
+    EMUX_START(2);
     Pico.t.z80c_cnt += z80_run(cnt);
+    EMUX_STOP(2);
 #ifdef N64_BENCH
     bench_z80_ticks += timer_ticks() - _bt; bench_z80_calls++;
 #endif

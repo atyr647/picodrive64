@@ -25,6 +25,7 @@
 #include <rdpq_tex.h>
 #include "rsp_audio.h"
 #include "rsp_fm.h"
+#include "emux.h"
 #ifdef DRC_68K
 #include "../../cpu/drc/drc68k.h"
 #endif
@@ -807,6 +808,21 @@ post_render: ;
 #ifdef N64_PROF_SAMPLE
 			if (f == BENCH_START)
 				ps_start();
+#endif
+#ifdef N64_EMUX
+			if (f == BENCH_START) EMUX_START(0);
+			if (f == BENCH_END) {
+				EMUX_STOP(0);
+				static const char *nm[5] = { "all", "68k", "z80", "vdp", "snd" };
+				for (int k = 0; k < 5; k++)
+					debugf("[EMUX] %-3s cyc/frame=%lu  I$miss/frame=%lu  D$miss/frame=%lu  D$wb/frame=%lu  I$hit/frame=%lu\n",
+						nm[k],
+						(unsigned long)(emux_profread(k, 0x0000) / (BENCH_END - BENCH_START)),
+						(unsigned long)(emux_profread(k, 0x0011) / (BENCH_END - BENCH_START)),
+						(unsigned long)(emux_profread(k, 0x0021) / (BENCH_END - BENCH_START)),
+						(unsigned long)(emux_profread(k, 0x0022) / (BENCH_END - BENCH_START)),
+						(unsigned long)(emux_profread(k, 0x0010) / (BENCH_END - BENCH_START)));
+			}
 #endif
 			if (f == BENCH_START) {
 				z0t = bench_z80_ticks; z0c = bench_z80_calls;
