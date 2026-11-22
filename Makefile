@@ -290,7 +290,12 @@ use_fame = 1
 use_cz80 = 1
 use_sh2drc = 0
 use_svpdrc = 0
-DRC_68K = 1
+# Experimental 68k->MIPS DRC (cpu/drc/drc68k.c).  This was "= 1" but never
+# actually ran: common.mak only added the source file and did not define
+# DRC_68K, so the 68k was 100% FAME.  Now that the define is wired it would
+# switch on never-before-run JIT code, so keep it opt-in until it has been
+# validated:   make DRC_68K=1 ...   (profiler prints a [DRC] line when on)
+DRC_68K ?= 0
 # RSP palette converter (unused - RDP blit replaced it)
 #OBJS += platform/n64/rsp_tiles.o platform/n64/rsp_render.o
 # RSP audio overlay + FM synthesis overlay

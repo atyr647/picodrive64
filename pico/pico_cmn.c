@@ -62,7 +62,9 @@ static void SekExecM68k(int cyc_do)
     if (drc_cycles >= 0) {
       Pico.t.m68c_cnt += drc_cycles - cyc_do;
     } else {
-      Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, cyc_do, 0) - cyc_do;
+      int fame_cycles = fm68k_emulate(&PicoCpuFM68k, cyc_do, 0);
+      drc68k.cyc_fame += (u32)fame_cycles;
+      Pico.t.m68c_cnt += fame_cycles - cyc_do;
     }
   }
 #else

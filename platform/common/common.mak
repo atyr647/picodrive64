@@ -160,6 +160,11 @@ endif
 # --- DRC ---
 SRCS_COMMON += $(R)cpu/drc/cmn.c
 ifeq "$(DRC_68K)" "1"
+# The source list alone is not enough: pico.c (drc68k_init) and pico_cmn.c
+# (the DRC->FAME dispatch) are guarded by #ifdef DRC_68K.  Without this define
+# drc68k.c compiles and links but is never called, and the 68k runs entirely
+# in FAME.
+DEFINES += DRC_68K
 SRCS_COMMON += $(R)cpu/drc/drc68k.c
 endif
 

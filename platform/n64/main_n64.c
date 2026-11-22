@@ -25,6 +25,9 @@
 #include <rdpq_tex.h>
 #include "rsp_audio.h"
 #include "rsp_fm.h"
+#ifdef DRC_68K
+#include "../../cpu/drc/drc68k.h"
+#endif
 
 /* Profiling counters (written by pico_cmn.c and draw.c, read here) */
 unsigned int __attribute__((used)) prof_68k_ticks = 0;
@@ -438,6 +441,68 @@ int main(int argc, char *argv[])
 				actual, (unsigned)expected,
 				drift_x100/100, (drift_x100<0?-drift_x100:drift_x100)%100,
 				snd_blocked_count, snd_underrun_count);
+
+#ifdef DRC_68K
+			{
+				/* 68k DRC coverage, per-second deltas.  The number that
+				 * matters is the cycle split, not call counts: DRC runs one
+				 * block per call but a FAME fallback runs the rest of the
+				 * slice.  "top" = opcodes (low 6 bits dropped) whose blocks
+				 * were entered most often via FAME; FULL = compile failed
+				 * because the block table / code cache was full. */
+				static unsigned int p_cd, p_cf, p_bx, p_cl, p_cfail, p_full, p_short;
+				static unsigned int p_hist[DRC68K_OPHIST_FULL + 1];
+				unsigned int d_cd = drc68k.cyc_drc - p_cd;
+				unsigned int d_cf = drc68k.cyc_fame - p_cf;
+				unsigned int d_bx = drc68k.blocks_executed - p_bx;
+				unsigned int d_cl = drc68k.calls_fame - p_cl;
+				unsigned int d_fail = drc68k.compile_fail - p_cfail;
+				unsigned int d_full = drc68k.fail_full - p_full;
+				unsigned int d_short = drc68k.fail_short - p_short;
+				p_cd = drc68k.cyc_drc;   p_cf = drc68k.cyc_fame;
+				p_bx = drc68k.blocks_executed; p_cl = drc68k.calls_fame;
+				p_cfail = drc68k.compile_fail; p_full = drc68k.fail_full;
+				p_short = drc68k.fail_short;
+
+				unsigned int tot_c = d_cd + d_cf;
+				unsigned int drc_pct10 = tot_c ?
+					(unsigned int)((uint64_t)d_cd * 1000 / tot_c) : 0;
+
+				int top_i[3] = { -1, -1, -1 };
+				unsigned int top_v[3] = { 0, 0, 0 };
+				for (int i = 0; i <= DRC68K_OPHIST_FULL; i++) {
+					unsigned int d = drc68k.op_hist[i] - p_hist[i];
+					p_hist[i] = drc68k.op_hist[i];
+					for (int k = 0; k < 3 && d; k++) {
+						if (d > top_v[k]) {
+							for (int m = 2; m > k; m--) {
+								top_v[m] = top_v[m-1]; top_i[m] = top_i[m-1];
+							}
+							top_v[k] = d; top_i[k] = i;
+							break;
+						}
+					}
+				}
+				char top[72];
+				int n = 0;
+				top[0] = 0;
+				for (int k = 0; k < 3 && top_i[k] >= 0; k++) {
+					if (top_i[k] == DRC68K_OPHIST_FULL)
+						n += snprintf(top + n, sizeof(top) - n, " FULL:%u", top_v[k]);
+					else
+						n += snprintf(top + n, sizeof(top) - n, " %04x:%u",
+						              top_i[k] << 6, top_v[k]);
+				}
+
+				debugf("[DRC] cyc drc=%u.%u%% (%u/%u) calls drc=%u fame=%u "
+				       "blocks=%d/%d cache=%uKB cfail=%u full=%u short=%u top:%s\n",
+					drc_pct10 / 10, drc_pct10 % 10, d_cd, d_cf,
+					d_bx, d_cl,
+					drc68k.block_count, DRC68K_BLOCK_MAX,
+					(unsigned int)((drc68k.cache_ptr - drc68k.cache) / 1024),
+					d_fail, d_full, d_short, top);
+			}
+#endif
 
 			prof_68k_acc = prof_vdp_acc = prof_snd_acc = prof_frame_acc = 0;
 			snd_total_samples = 0;

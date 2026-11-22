@@ -1443,6 +1443,10 @@ static int compile_one_insn(u32 pc, int *cycles_out)
 	}
 }
 
+/* Histogram bucket (see drc68k_state_t.op_hist) for the opcode that made the
+ * most recent compile_block() call fail.  Read by drc68k_execute(). */
+static u16 compile_fail_bucket;
+
 /* Compile a basic block starting at addr_68k.
  * Returns the block, or NULL if compilation fails. */
 static drc68k_block_t *compile_block(u32 addr_68k)
@@ -1453,11 +1457,17 @@ static drc68k_block_t *compile_block(u32 addr_68k)
 	int total_cycles = 0;
 	int insn_count = 0;
 	int ended_with_branch = 0;
+	u16 last_op = 0;
+	int unsupported = 0;
 
-	if (drc68k.block_count >= DRC68K_BLOCK_MAX)
+	if (drc68k.block_count >= DRC68K_BLOCK_MAX ||
+	    (u8 *)tcache_ptr + 1024 > drc68k.cache_end) {
+		/* No eviction exists: once either limit is hit, every NEW block
+		 * fails from here on and runs in FAME. */
+		drc68k.fail_full++;
+		compile_fail_bucket = DRC68K_OPHIST_FULL;
 		return NULL;
-	if ((u8 *)tcache_ptr + 1024 > drc68k.cache_end)
-		return NULL;
+	}
 
 	block = &drc68k.blocks[drc68k.block_count];
 	block->addr_68k = addr_68k;
@@ -1480,10 +1490,13 @@ static drc68k_block_t *compile_block(u32 addr_68k)
 	pc = addr_68k;
 	while (insn_count < DRC68K_MAX_BLOCK_INSNS) {
 		int insn_cycles = 0;
+		last_op = fetch_68k_word(pc);
 		int consumed = compile_one_insn(pc, &insn_cycles);
 
-		if (consumed < 0)
+		if (consumed < 0) {
+			unsupported = 1;
 			break; /* unsupported opcode */
+		}
 
 		int block_end = (consumed & 0x8000) != 0;
 		consumed &= 0x7fff;
@@ -1499,7 +1512,12 @@ static drc68k_block_t *compile_block(u32 addr_68k)
 	}
 
 	if (insn_count < 2) {
-		/* Block too short - prologue/epilogue overhead exceeds benefit. */
+		/* Block too short - prologue/epilogue overhead exceeds benefit.
+		 * last_op is the offending insn when unsupported, otherwise the
+		 * (supported) branch that ended a 1-insn block. */
+		if (!unsupported)
+			drc68k.fail_short++;
+		compile_fail_bucket = last_op >> 6;
 		tcache_ptr = (u32 *)code_start;
 		return NULL;
 	}
@@ -1571,10 +1589,13 @@ void drc68k_init(void)
 #define NEG_CACHE_SIZE 4096
 #define NEG_CACHE_MASK (NEG_CACHE_SIZE - 1)
 static u32 neg_cache[NEG_CACHE_SIZE];
+/* Histogram bucket of the opcode that put each neg_cache entry there. */
+static u16 neg_bucket[NEG_CACHE_SIZE];
 
 void drc68k_reset(void)
 {
 	memset(neg_cache, 0, sizeof(neg_cache));
+	memset(neg_bucket, 0, sizeof(neg_bucket));
 	drc68k.block_count = 0;
 	drc68k.cache_ptr = drc68k.cache;
 	tcache_ptr = (u32 *)drc68k.cache;
@@ -1597,8 +1618,11 @@ int drc68k_execute(M68K_CONTEXT *ctx, u32 addr, int cycles_max)
 
 	/* Check negative cache first — instant reject for known-uncompilable */
 	int nh = (addr >> 1) & NEG_CACHE_MASK;
-	if (neg_cache[nh] == addr)
+	if (neg_cache[nh] == addr) {
+		drc68k.calls_fame++;
+		drc68k.op_hist[neg_bucket[nh]]++;
 		return -1;
+	}
 
 	/* Look up in block hash table */
 	s16 idx = drc68k.hash[h];
@@ -1617,7 +1641,11 @@ int drc68k_execute(M68K_CONTEXT *ctx, u32 addr, int cycles_max)
 	if (!block) {
 		/* Remember this address can't be compiled */
 		neg_cache[nh] = addr;
+		neg_bucket[nh] = compile_fail_bucket;
 		drc68k.fallbacks++;
+		drc68k.compile_fail++;
+		drc68k.calls_fame++;
+		drc68k.op_hist[compile_fail_bucket]++;
 		return -1;
 	}
 
@@ -1627,5 +1655,6 @@ int drc68k_execute(M68K_CONTEXT *ctx, u32 addr, int cycles_max)
 	cycles_used = fn(ctx, cycles_max);
 
 	drc68k.blocks_executed++;
+	drc68k.cyc_drc += (u32)cycles_used;
 	return cycles_used;
 }

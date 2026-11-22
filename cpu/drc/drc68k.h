@@ -44,11 +44,30 @@ typedef struct {
 	/* Hash table: 68k address -> block index (or -1) */
 	s16 hash[DRC68K_HASH_SIZE];
 
-	/* Statistics */
+	/* Statistics (cumulative; the N64 profiler prints per-second deltas).
+	 *
+	 * Cycles are the metric that matters, not call counts: DRC runs ONE
+	 * block per drc68k_execute() call, but a FAME fallback runs the whole
+	 * remaining cycle budget of the slice, so a single uncompilable block
+	 * can hand a long stretch of (possibly compilable) code to FAME. */
 	u32 blocks_compiled;
-	u32 blocks_executed;
-	u32 fallbacks;          /* opcodes that fell back to interpreter */
+	u32 blocks_executed;    /* drc68k_execute() calls that ran native code */
+	u32 fallbacks;          /* first-time compile failures (unique addrs) */
+	u32 calls_fame;         /* drc68k_execute() calls that returned -1 */
+	u32 compile_fail;       /* every failed compile attempt (incl. repeats) */
+	u32 fail_full;          /* ...of which: block table or code cache full */
+	u32 fail_short;         /* ...of which: block < 2 insns (supported but too short) */
+	u32 cyc_drc;            /* 68k cycles executed as native code */
+	u32 cyc_fame;           /* 68k cycles executed in FAME (set by pico_cmn.c) */
+
+	/* Which opcodes send execution to FAME, weighted by how often that
+	 * block start is entered: bucket = (opcode >> 6), i.e. the opcode with
+	 * its low 6 bits (EA mode/reg) dropped.  Index DRC68K_OPHIST_FULL is
+	 * "compile failed because the cache/table was full". */
+	u32 op_hist[1025];
 } drc68k_state_t;
+
+#define DRC68K_OPHIST_FULL  1024
 
 extern drc68k_state_t drc68k;
 
