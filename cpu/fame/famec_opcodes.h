@@ -40274,6 +40274,7 @@ OPCODE(0x6601_idle)
 	{
 		UPDATE_IDLE_COUNT
 		PC += ((s8)(Opcode & 0xFE)) >> 1;
+		IDLE_EXIT_HOOK
 		//if (idle_hit)
 		RET0()
 	}
@@ -40286,6 +40287,7 @@ OPCODE(0x6701_idle)
 	{
 		UPDATE_IDLE_COUNT
 		PC += ((s8)(Opcode & 0xFE)) >> 1;
+		IDLE_EXIT_HOOK
 		//if (idle_hit)
 		RET0()
 	}

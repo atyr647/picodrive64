@@ -652,6 +652,16 @@ void fm68k_init(void)
 /*     M68K_NO_SUP_ADDR_SPACE (2):  No se puede resetear porque no hay mapa   */
 /*             de memoria supervisor de extraccion de opcodes                 */
 /******************************************************************************/
+#ifdef FAME_IDLE_SKIP
+/* host PC of the idle loop the last slice ended in (set by the idle Bcc
+ * handlers right before RET0), NULL if it ended any other way */
+static u16 *idle_exit_ptr;
+static int idle_kind;		/* fm68k_emulate_idle(): 0 none, 1/2/3 tst.b/w/l */
+#define IDLE_EXIT_HOOK idle_exit_ptr = PC;
+#else
+#define IDLE_EXIT_HOOK
+#endif
+
 int fm68k_reset(M68K_CONTEXT *ctx)
 {
 	if (!initialised)
@@ -663,6 +673,9 @@ int fm68k_reset(M68K_CONTEXT *ctx)
 
 	// Resetear registros
 	//memset(&ctx->dreg[0], 0, 16*4);
+#ifdef FAME_IDLE_SKIP
+	idle_kind = 0;
+#endif
 
 	// Resetear interrupts, execinfo y ASP
 	ctx->interrupts[0] = 0;
@@ -714,6 +727,76 @@ int fm68k_would_interrupt(M68K_CONTEXT *ctx)
 {
 	return interrupt_chk__(ctx);
 }
+
+#ifdef FAME_IDLE_SKIP
+/* fm68k_emulate() for a new timeslice, skipping slices that would only spin
+ * in a detected idle loop of the form
+ *     L:   tst.{b,w,l} (xxx).w      ; RAM or ROM, side-effect free read
+ *          b<cc>  L                 ; idle-patched by PicoDrive
+ * When a slice ends in such a loop (the idle Bcc's RET0), the tested value
+ * is captured.  A later slice is then skipped if FAME would provably do the
+ * same thing again: CPU still at L with the same code and memory map, no
+ * interrupt to take, not halted/tracing, the tested value unchanged (re-read
+ * now), and the slice longer than the tst (so the branch runs and ends the
+ * slice).  FAME would execute tst (same flags, as the value is the same)
+ * and the idle branch, whose RET0 leaves io_cycle_counter at -6, so it
+ * would return cycles + 6 with all state unchanged: return exactly that.
+ * Saves the per-line FAME entry/exit for the ~170 idle lines a frame a
+ * typical game spends in its vblank wait. */
+static u16 *idle_ptr;
+static uptr idle_fetch;
+static u32 idle_pc, idle_ea, idle_val;
+static u16 idle_code[3];
+
+static u32 idle_read(M68K_CONTEXT *ctx, int kind, u32 ea)
+{
+	switch (kind) {
+	case 1:  return ctx->read_byte(ea) & 0xff;
+	case 2:  return ctx->read_word(ea) & 0xffff;
+	default: return ctx->read_long(ea);
+	}
+}
+
+int fm68k_emulate_idle(M68K_CONTEXT *ctx, int cycles)
+{
+	int ret;
+
+	if (idle_kind && ctx->pc == idle_pc
+	    && cycles > (idle_kind == 3 ? 16 : 12)
+	    && !(ctx->execinfo & (FM68K_HALTED | M68K_RUNNING))
+	    && !(ctx->sr & 0x8000)
+	    && ctx->interrupts[0] <= ((ctx->sr >> 8) & 7)
+	    && ctx->Fetch[(idle_pc >> M68K_FETCHSFT) & M68K_FETCHMASK] == idle_fetch
+	    && idle_ptr[0] == idle_code[0] && idle_ptr[1] == idle_code[1]
+	    && idle_ptr[2] == idle_code[2]
+	    && idle_read(ctx, idle_kind, idle_ea) == idle_val)
+		return cycles + 6;
+
+	ret = fm68k_emulate(ctx, cycles, fm68k_reason_emulate);
+
+	if (idle_exit_ptr) {
+		u16 *p = idle_exit_ptr;
+		u32 ea = (u32)(s32)(s16)p[1] & 0xffffff;
+		int kind = p[0] == 0x4a38 ? 1 : p[0] == 0x4a78 ? 2 : p[0] == 0x4ab8 ? 3 : 0;
+		/* patched idle beq/bne/bra (0x71/0x75/0x7d) branching back 6 bytes */
+		if (kind && (p[2] & 0xf3ff) == 0x71fa && (ea < 0x8000 || ea >= 0xff8000)) {
+			idle_kind = kind;
+			idle_ptr = p;
+			idle_pc = ctx->pc;
+			idle_fetch = ctx->Fetch[(idle_pc >> M68K_FETCHSFT) & M68K_FETCHMASK];
+			idle_code[0] = p[0]; idle_code[1] = p[1]; idle_code[2] = p[2];
+			idle_ea = (u32)(s32)(s16)p[1];
+			idle_val = idle_read(ctx, kind, idle_ea);
+		}
+	}
+	return ret;
+}
+
+void fm68k_idle_invalidate(void)
+{
+	idle_kind = 0;
+}
+#endif
 
 static FAMEC_EXTRA_INLINE u32 execute_exception(M68K_CONTEXT *ctx, s32 vect, u32 oldPC, u32 oldSR)
 {
@@ -851,6 +934,10 @@ int fm68k_emulate(M68K_CONTEXT *ctx, int cycles, fm68k_call_reason reason)
 #endif
 
 	/* guardar ciclos de ejecucion solicitados */
+#ifdef FAME_IDLE_SKIP
+	idle_exit_ptr = NULL;
+	idle_kind = 0;
+#endif
 	ctx->io_cycle_counter = cycles;
 	cycles_needed = 0;
 

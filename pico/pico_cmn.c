@@ -80,13 +80,18 @@ static void SekExecM68k(int cyc_do)
     }
   }
 #else
+#ifdef FAME_IDLE_SKIP
+#define SEK_FAME_RUN(c) fm68k_emulate_idle(&PicoCpuFM68k, c)
+#else
+#define SEK_FAME_RUN(c) fm68k_emulate(&PicoCpuFM68k, c, 0)
+#endif
 #ifdef N64_EMUX
   { extern int emux_in68k; extern unsigned int emux_fame_calls;
     emux_in68k = 1; emux_fame_calls++; EMUX_START(5);
-  Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, cyc_do, 0) - cyc_do;
+  Pico.t.m68c_cnt += SEK_FAME_RUN(cyc_do) - cyc_do;
     EMUX_STOP(5); emux_in68k = 0; }
 #else
-  Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, cyc_do, 0) - cyc_do;
+  Pico.t.m68c_cnt += SEK_FAME_RUN(cyc_do) - cyc_do;
 #endif
 #endif
 #endif

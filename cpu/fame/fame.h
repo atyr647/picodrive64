@@ -177,6 +177,10 @@ void fm68k_init(void);
 int  fm68k_reset(M68K_CONTEXT *ctx);
 int  fm68k_emulate(M68K_CONTEXT *ctx, int n, fm68k_call_reason reason);
 int  fm68k_would_interrupt(M68K_CONTEXT *ctx); // to be called from fm68k_emulate()
+#ifdef FAME_IDLE_SKIP
+int  fm68k_emulate_idle(M68K_CONTEXT *ctx, int n); // fm68k_emulate() that skips provably idle slices
+void fm68k_idle_invalidate(void);
+#endif
 
 u32 fm68k_get_pc(const M68K_CONTEXT *ctx);
 

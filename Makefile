@@ -300,6 +300,9 @@ endif
 # (platform/n64/tools/make_dev_rom.sh), so dev and release ROMs share code
 # and code layout.
 CFLAGS += -DN64_BENCH
+# Skip 68k timeslices that would only spin in a detected idle loop
+# (cpu/fame/famec.c fm68k_emulate_idle; exact, see comment there).
+CFLAGS += -DFAME_IDLE_SKIP
 N64_Z80_ACCEL ?= 1
 ifeq "$(N64_Z80_ACCEL)" "1"
 CFLAGS += -DZ80_DRIVER_ACCEL

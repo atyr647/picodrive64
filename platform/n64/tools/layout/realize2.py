@@ -12,9 +12,9 @@ from collections import defaultdict
 args = sys.argv[1:]
 out_ld = args[-1]
 ALIGN = {}
-if os.environ.get('ALIGN_FILE'):
-    for l in open(os.environ['ALIGN_FILE']):
-        lo_, hi_, n_ = l.split(); ALIGN[n_] = int(lo_)
+for _af in filter(None, os.environ.get('ALIGN_FILE', '').split(':')):
+    for l in open(_af):
+        lo_, hi_, n_ = l.split(); ALIGN[n_] = max(ALIGN.get(n_, 4), int(lo_))
 
 def realize(entries, hot_color, page, line, base, margin, default_align, padfmt):
     """entries: list of (name, size, pattern, orig_addr); returns list of script lines and stats"""

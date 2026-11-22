@@ -259,6 +259,9 @@ PICO_INTERNAL void SekUnpackCpu(const unsigned char *cpu, int is_sub)
   context->interrupts[0] = cpu[0x4c];
   context->execinfo &= ~FM68K_HALTED;
   if (cpu[0x4d]&1) context->execinfo |= FM68K_HALTED;
+#ifdef FAME_IDLE_SKIP
+  fm68k_idle_invalidate();
+#endif
 #endif
   if (is_sub) {
     SekCycleCntS68k = *(u32 *)(cpu+0x50);
