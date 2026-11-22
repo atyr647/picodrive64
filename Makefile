@@ -323,6 +323,11 @@ OBJS += platform/n64/rsp_fm_ovl.o platform/n64/rsp_fm.o
 platform/n64/rsp_fm.o: CFLAGS += -fno-lto
 platform/n64/rsp_audio.o: CFLAGS += -fno-lto
 platform/n64/main_n64.o: CFLAGS += -fno-lto
+# Cz80 is one ~30KB computed-goto function, ~2x the 16KB I-cache: -O3's
+# unrolling/inlining makes its hot handlers conflict more.  Measured with
+# ares emux counters: Z80 time 659k -> 537k cycles/frame, I$ misses 3952 ->
+# 1386 per frame.
+cpu/cz80/cz80.o: CFLAGS += -O2 -fno-unroll-loops
 OBJS += platform/n64/draw_rdp.o
 ifeq "$(N64_EMBEDDED_ROM)" "1"
 # Standalone mode: single file has main + all platform stubs
