@@ -381,6 +381,9 @@ static void blit_frame(surface_t *fb)
 	}
 }
 
+/* writable copy of the embedded ROM, see main() */
+static unsigned char n64_rom_buf[EMBEDDED_ROM_SIZE + 4] __attribute__((aligned(16)));
+
 int main(int argc, char *argv[])
 {
 	unsigned char *rom_copy;
@@ -427,12 +430,11 @@ int main(int argc, char *argv[])
 	PicoIn.sndOut = snd_buffer;
 	PicoIn.writeSound = write_sound;
 
-	rom_copy = (unsigned char *)malloc(EMBEDDED_ROM_SIZE + 4);
-	if (!rom_copy) {
-		printf("  ERROR: Out of memory!\n");
-		console_render();
-		for (;;) {}
-	}
+	/* Writable ROM copy (PicoDrive patches idle loops into it).  A static
+	 * .bss object rather than malloc: its D-cache position is then set by
+	 * platform/n64/layout.ld like any other hot data, instead of following
+	 * wherever the heap starts. */
+	rom_copy = n64_rom_buf;
 	memcpy(rom_copy, embedded_rom_data, EMBEDDED_ROM_SIZE);
 
 	if (PicoCartInsert(rom_copy, EMBEDDED_ROM_SIZE, NULL)) {

@@ -887,13 +887,19 @@ static INLINE void update_eg_phase(FM_SLOT *SLOT, UINT32 eg_cnt, UINT32 ssg_en)
 }
 
 #if defined(N64) && !defined(N64_FM_CPU)
-/* EG counter after n more ticks: it runs 1..4095 (++cnt >= 4096 -> 1) */
+/* EG counter after n more ticks: it runs 1..4095 (++cnt >= 4096 -> 1).
+ * No division: n is at most a few thousand here. */
 static UINT32 eg_cnt_add(UINT32 cnt, UINT32 n)
 {
-	if (!n)
-		return cnt;
-	if (cnt == 0) { cnt = 1; n--; }
-	return (cnt - 1 + n) % 4095 + 1;
+	if (cnt == 0) {
+		if (!n)
+			return 0;
+		cnt = 1; n--;
+	}
+	cnt += n;
+	while (cnt >= 4096)
+		cnt -= 4095;
+	return cnt;
 }
 
 /* Advance one slot's envelope over upd EG updates that follow counter value
@@ -917,6 +923,11 @@ static void eg_advance_slot(FM_SLOT *SLOT, UINT32 egc, UINT32 upd, UINT32 ssg_en
 		upd -= d;
 		egc = eg_cnt_add(egc, d);
 		update_eg_phase(SLOT, egc, ssg_en);
+		/* sustain at exactly maximum attenuation (non-SSG): every further
+		 * update gives volume MAX, state SUS, vol_out MAX + tl again */
+		if (SLOT->state == EG_SUS && SLOT->volume == MAX_ATT_INDEX
+		    && !((SLOT->ssg & 0x08) && ssg_en))
+			break;
 	}
 }
 #endif
