@@ -2,7 +2,7 @@
 # ares_profile.sh ROM [SECONDS] [OUTPREFIX]
 #
 # Run a PicoDrive64 ROM headless in ares and capture the profiler output
-# ([F]/[SEC]/[DRC] lines arrive via IS-Viewer, which ares prints to its
+# ([SEC] lines; [F] per-frame lines with -DN64_PERF_HUD; [DRC] with DRC_68K=1 arrive via IS-Viewer, which ares prints to its
 # terminal) plus a final screenshot.  The profiler measures emulated N64 time,
 # so numbers are meaningful regardless of host speed, and ares models VR4300
 # cache-miss penalties -- it tracked real hardware within a few % here.
@@ -33,7 +33,7 @@ for k in SKIP REND; do
 	sed -E 's/.*ft=([0-9.]+)ms cpu:([0-9]+) vdp:([0-9]+).*snd:([0-9]+).*/\1 \2 \3 \4/' |
 	awk -v k=$k '{n++; ft+=$1; c+=$2; v+=$3; s+=$4}
 		END{ if(n) printf "%s n=%d ft=%.1fms cpu=%.1f vdp=%.1f snd=%.1f\n",k,n,ft/n,c/n,v/n,s/n;
-		     else printf "%s: no frames (did it boot? see %s)\n",k,FILENAME }'
+		     else printf "%s: no [F] lines (per-frame stats need -DN64_PERF_HUD)\n",k }'
 done
 grep -aE "^\[SEC\]" "$OUT.log" | tail -1
 grep -aE "^\[DRC\]" "$OUT.log" | tail -1
