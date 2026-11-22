@@ -1829,7 +1829,7 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 	refresh_fc_eg_chan( &ym2612.CH[4] );
 	refresh_fc_eg_chan( &ym2612.CH[5] );
 
-#ifdef N64
+#if defined(N64) && !defined(N64_FM_CPU)
 	/* RSP FM synthesis, pipelined by one frame.
 	 *
 	 * Frame N's job is submitted here and NOT waited for: this call returns
@@ -1906,12 +1906,12 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 				rch->mem_src   = algo_lut[algo][4];
 			}
 
-			/* Advance phases exactly as the RSP will (per-sample 32-bit add) */
-			fmch->SLOT[SLOT1].phase += (UINT32)fmch->SLOT[SLOT1].Incr * (UINT32)length;
-			fmch->SLOT[SLOT2].phase += (UINT32)fmch->SLOT[SLOT2].Incr * (UINT32)length;
-			fmch->SLOT[SLOT3].phase += (UINT32)fmch->SLOT[SLOT3].Incr * (UINT32)length;
-			fmch->SLOT[SLOT4].phase += (UINT32)fmch->SLOT[SLOT4].Incr * (UINT32)length;
 		}
+		/* Channel 6 output is replaced by the DAC while it is enabled (the C
+		 * renderer passes a "disabled" flag for it: envelope and phases still
+		 * advance, only the FM output is muted). */
+		if (ym2612.dacen)
+			st->ch[5].enabled = 0;
 		st->num_samples = length;
 
 		/* Submit RSP FM (non-blocking, never waited for this frame) */
@@ -1920,42 +1920,65 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 		fm_sync[cur] = rspq_syncpoint_new();
 		fm_len[cur] = length;
 
-		/* Advance envelopes + LFO (CPU-side state only).
-		 *
-		 * Batched: the original per-sample outer loop only updates
-		 * the timer; inner work depends solely on tick count. So we
-		 * collapse the outer loop to one math op and run the inner
-		 * loop `ticks` times. Semantically identical. */
+		/* Advance envelopes (CPU-side state only), replicating the C
+		 * renderer (chan_render/chan_render_loop) exactly: every active
+		 * channel runs its OWN copy of eg_cnt from the same start value
+		 * (the old batched loop shared one global counter that every
+		 * active channel bumped, so envelope rates depended on how many
+		 * channels were playing); a per-channel 2-bit counter selects
+		 * every 3rd EG tick; the global eg_cnt ends at the last rendered
+		 * channel's value.  The batching (all ticks of the frame at once,
+		 * no per-sample loop) is unchanged.
+		 * NB envelopes still reach the RSP once per frame (vol_out
+		 * snapshot), and SSG-EG / LFO are not applied on this path. */
 		{
 			uint64_t total = (uint64_t)ym2612.OPN.eg_timer
 				+ (uint64_t)ym2612.OPN.eg_timer_add * (uint32_t)length;
 			uint32_t ticks = (uint32_t)(total >> EG_SH);
-			ym2612.OPN.eg_timer = (uint32_t)total & ((1u << EG_SH) - 1);
+			UINT32 eg_start = ym2612.OPN.eg_cnt, eg_end = eg_start;
+			int ch, any = 0;
 
-			while (ticks--) {
-				int ch;
-				for (ch = 0; ch < 6; ch++) {
-					if (!(ym2612.slot_mask & (0xf << (ch*4))))
-						continue;
-					if (ym2612.CH[ch].upd_cnt > 0) {
-						ym2612.CH[ch].upd_cnt--;
-						continue;
-					}
-					ym2612.CH[ch].upd_cnt = 2;
-					ym2612.OPN.eg_cnt++;
-					if (ym2612.OPN.eg_cnt >= 4096)
-						ym2612.OPN.eg_cnt = 1;
-					{
-						int s;
-						UINT32 ssg_en = (ym2612.ssg_mask >> (ch*4)) & 0xf;
-						ssg_en = ssg_en && (ym2612.OPN.ST.flags & ST_SSG);
-						for (s = 0; s < 4; s++) {
-							if (ym2612.CH[ch].SLOT[s].state != EG_OFF)
-								update_eg_phase(&ym2612.CH[ch].SLOT[s],
-									ym2612.OPN.eg_cnt, ssg_en);
-						}
+			for (ch = 0; ch < 6; ch++) {
+				FM_CH *fch = &ym2612.CH[ch];
+				UINT32 cnt, egc = eg_start, t;
+				UINT32 ssg_en;
+				if (!(ym2612.slot_mask & (0xf << (ch*4))))
+					continue;
+				ssg_en = ((ym2612.ssg_mask >> (ch*4)) & 0xf) && (ym2612.OPN.ST.flags & ST_SSG);
+				cnt = fch->upd_cnt & 3;
+				for (t = ticks; t; t--) {
+					if (cnt) cnt--;
+					if (!cnt) {
+						cnt = 3;
+						if (++egc >= 4096) egc = 1;
+						if (fch->SLOT[SLOT1].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT1], egc, ssg_en);
+						if (fch->SLOT[SLOT2].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT2], egc, ssg_en);
+						if (fch->SLOT[SLOT3].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT3], egc, ssg_en);
+						if (fch->SLOT[SLOT4].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT4], egc, ssg_en);
 					}
 				}
+				fch->upd_cnt = cnt;
+				eg_end = egc;
+				any = 1;
+
+				/* end of chan_render(): a channel still sounding keeps the
+				 * phases it rendered with (advanced exactly as the RSP does:
+				 * 32-bit add of incr per sample); one whose four envelopes
+				 * are all off drops out of slot_mask and keeps its old
+				 * phases. */
+				if (fch->SLOT[SLOT1].state | fch->SLOT[SLOT2].state |
+				    fch->SLOT[SLOT3].state | fch->SLOT[SLOT4].state) {
+					fch->SLOT[SLOT1].phase += (UINT32)fch->SLOT[SLOT1].Incr * (UINT32)length;
+					fch->SLOT[SLOT2].phase += (UINT32)fch->SLOT[SLOT2].Incr * (UINT32)length;
+					fch->SLOT[SLOT3].phase += (UINT32)fch->SLOT[SLOT3].Incr * (UINT32)length;
+					fch->SLOT[SLOT4].phase += (UINT32)fch->SLOT[SLOT4].Incr * (UINT32)length;
+				} else
+					ym2612.slot_mask &= ~(0xf << (ch*4));
+			}
+			/* like chan_render_finish: unchanged if no channel ran */
+			if (any) {
+				ym2612.OPN.eg_cnt = eg_end;
+				ym2612.OPN.eg_timer = (uint32_t)total & ((1u << EG_SH) - 1);
 			}
 		}
 		ym2612.OPN.lfo_cnt += ym2612.OPN.lfo_inc * length;

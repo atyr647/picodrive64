@@ -515,7 +515,7 @@ static int PsndRender(int offset, int length)
     Pico.snd.dac_val2 = Pico.snd.dac_val;
   }
 
-#ifdef N64
+#if defined(N64) && !defined(N64_FM_CPU)
   // ym2612.c pipelines the RSP FM render by one frame (the FM update below
   // returns the PREVIOUS frame's FM).  Delay this frame's DAC/PSG by one
   // frame too, so everything stays aligned: output = DAC/PSG(N-1)+FM(N-1).

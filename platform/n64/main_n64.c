@@ -832,6 +832,23 @@ post_render: ;
 			if (f == BENCH_START)
 				memset(z80_pchist, 0, sizeof(z80_pchist));
 #endif
+#ifdef BENCH_EG_TRACE
+			if (f >= BENCH_START && f <= BENCH_END) {
+				uint32_t eh = 2166136261u;
+				for (int c = 0; c < 6; c++) {
+					for (int k = 0; k < 4; k++) {
+						FM_SLOT *sl = &ym2612.CH[c].SLOT[k];
+						uint32_t v[3] = { (uint32_t)sl->volume, sl->state, sl->vol_out };
+						eh = bench_hash(v, sizeof(v), eh);
+					}
+					uint32_t u = ym2612.CH[c].upd_cnt & 3;
+					eh = bench_hash(&u, 4, eh);
+				}
+				uint32_t g[2] = { ym2612.OPN.eg_cnt, ym2612.OPN.eg_timer };
+				eh = bench_hash(g, sizeof(g), eh);
+				debugf("[EG] %u %08lx ssg=%08lx fl=%x slots=%06lx\n", f, (unsigned long)eh, (unsigned long)ym2612.ssg_mask, ym2612.OPN.ST.flags, (unsigned long)ym2612.slot_mask);
+			}
+#endif
 			if (f == BENCH_END || f == BENCH_END + 1)
 				debugf("[AUDIO] f=%u samples=%u hash=%08lx fbframes=%u fbhash=%08lx\n", f, bench_audio_n,
 				       (unsigned long)bench_audio_hash, bench_fb_n, (unsigned long)bench_fb_hash);
