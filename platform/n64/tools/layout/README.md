@@ -26,6 +26,17 @@ changes to hot code.
 
 ## Regenerating
 
+After changing hot code, from the repo root:
+
+```sh
+ARES=/path/to/patched/ares platform/n64/tools/layout/regen.sh /tmp/layout-work
+```
+
+(~40 min: two LTO builds, four traces, ~20k I-cache and ~3k D-cache
+annealing steps.)  It warm-starts from `colors/`, rewrites `layout.ld` and
+`colors/`, and leaves the repo built with the new layout.  The manual steps
+it automates are below.
+
 Needs the patched ares (`ares-cachetrace.patch`, against the ares tree that
 atyr647/Pak `tools/build_ares.sh` builds, ares commit af4cbb0).  It adds emux
 `XPROF` codes 6/7 (cache-miss histograms) and 8/9 (I-fetch-run / data-access
