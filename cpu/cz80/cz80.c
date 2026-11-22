@@ -267,9 +267,19 @@ static INT32 z80_driver_accel(cz80_struc *CPU)
 	if (CPU->Status && (CPU->Status != CZ80_HAS_INT || zIFF1))
 		return -1;
 	ram = (UINT8 *)CPU->Fetch[0];
-	if (memcmp(ram + 0x23, drvacc_code, 0x31 - 0x23) ||
-	    memcmp(ram + 0x32, drvacc_code + (0x32 - 0x23), 0x5d - 0x32))
-		return -1;
+	{
+		/* code check with 8-byte (unaligned) loads, ranges 0x23-0x30 and
+		 * 0x32-0x5c (0x31 skipped), overlapping where needed */
+		static const UINT8 offs[8] = { 0x23, 0x29, 0x32, 0x3a, 0x42, 0x4a, 0x52, 0x55 };
+		int i;
+		for (i = 0; i < 8; i++) {
+			unsigned long long x, y;
+			memcpy(&x, ram + offs[i], 8);
+			memcpy(&y, drvacc_code + (offs[i] - 0x23), 8);
+			if (x != y)
+				return -1;
+		}
+	}
 
 #define DA_RET(pc_)  { zR += n; return pc_; }
 #define DA_STEP(pc_) if (CPU->ICount <= 0) DA_RET(pc_) n++;

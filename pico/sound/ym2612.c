@@ -886,6 +886,41 @@ static INLINE void update_eg_phase(FM_SLOT *SLOT, UINT32 eg_cnt, UINT32 ssg_en)
 	SLOT->volume = volume;
 }
 
+#if defined(N64) && !defined(N64_FM_CPU)
+/* EG counter after n more ticks: it runs 1..4095 (++cnt >= 4096 -> 1) */
+static UINT32 eg_cnt_add(UINT32 cnt, UINT32 n)
+{
+	if (!n)
+		return cnt;
+	if (cnt == 0) { cnt = 1; n--; }
+	return (cnt - 1 + n) % 4095 + 1;
+}
+
+/* Advance one slot's envelope over upd EG updates that follow counter value
+ * egc.  update_eg_phase() only acts when the counter is a multiple of
+ * 1 << shift (shift from the slot's current state), so jump straight from
+ * one such counter value to the next instead of visiting every update;
+ * slots are independent, so per-slot order is the same as per-tick.
+ * Same result as calling update_eg_phase() for every counter value. */
+static void eg_advance_slot(FM_SLOT *SLOT, UINT32 egc, UINT32 upd, UINT32 ssg_en)
+{
+	while (SLOT->state != EG_OFF) {
+		UINT32 shift = SLOT->eg_pack[SLOT->state - 1] >> 24, d;
+		if (shift == 0)
+			d = 1;
+		else {
+			UINT32 n = ((egc >> shift) + 1) << shift;
+			d = n < 4096 ? n - egc : (4095 - egc) + (1u << shift);
+		}
+		if (d > upd)
+			break;
+		upd -= d;
+		egc = eg_cnt_add(egc, d);
+		update_eg_phase(SLOT, egc, ssg_en);
+	}
+}
+#endif
+
 static INLINE UINT32 update_ssg_eg_phase(FM_SLOT *SLOT, UINT32 phase)
 {
 	if (SLOT->ssg&0x01) {
@@ -1955,13 +1990,11 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 				else {
 					UINT32 upd = 1 + (ticks - t) / 3;
 					cnt = 3 - (ticks - t) % 3;
-					do {
-						if (++egc >= 4096) egc = 1;
-						if (fch->SLOT[SLOT1].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT1], egc, ssg_en);
-						if (fch->SLOT[SLOT2].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT2], egc, ssg_en);
-						if (fch->SLOT[SLOT3].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT3], egc, ssg_en);
-						if (fch->SLOT[SLOT4].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT4], egc, ssg_en);
-					} while (--upd);
+					eg_advance_slot(&fch->SLOT[SLOT1], egc, upd, ssg_en);
+					eg_advance_slot(&fch->SLOT[SLOT2], egc, upd, ssg_en);
+					eg_advance_slot(&fch->SLOT[SLOT3], egc, upd, ssg_en);
+					eg_advance_slot(&fch->SLOT[SLOT4], egc, upd, ssg_en);
+					egc = eg_cnt_add(egc, upd);
 				}
 				fch->upd_cnt = cnt;
 				eg_end = egc;
