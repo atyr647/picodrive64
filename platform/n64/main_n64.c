@@ -42,6 +42,12 @@ unsigned int __attribute__((used)) prof_vdp_final_ticks = 0;
  * alone isn't a reliable signal.  Actual 0x2a writes are. */
 unsigned int __attribute__((used)) ym_dac_writes = 0;
 
+/* Per-frame perf output -- the "[F] ..." debug line every frame and the
+ * on-screen "e.. d.. 68k.. V.. S.." text -- costs ~1 ms/frame (measured on
+ * ares; more on hardware, where debugf goes over USB), so it is opt-in:
+ *   make N64_EMBEDDED_ROM=1 EXTRA_CFLAGS=-DN64_PERF_HUD
+ * The once-per-second [SEC] summary is always on. */
+
 /* Tile renderer selector: 0 = draw2.c CPU path (proven, current default),
  * 1 = draw_rdp.c RDP path (in development).  Toggle via menu or define
  * to A/B test while the RDP renderer matures.  For quick command-line
@@ -396,7 +402,9 @@ int main(int argc, char *argv[])
 	int fps_count = 0;
 	int fps_display = 0;
 	unsigned int fps_timer = timer_ticks();
+#ifdef N64_PERF_HUD
 	char fps_buf[40];
+#endif
 
 	/* Detailed profiling accumulators (ticks per second, for on-screen) */
 	unsigned int prof_68k_acc = 0, prof_vdp_acc = 0;
@@ -455,7 +463,7 @@ int main(int argc, char *argv[])
 			 * display_get() below can hand us a free buffer. */
 			if (pending_fb) {
 				rspq_wait();
-				data_cache_hit_invalidate(pending_fb->buffer, 320 * 240 * 2);
+#ifdef N64_PERF_HUD
 				graphics_set_color(
 					graphics_make_color(0xFF,0xFF,0xFF,0xFF),
 					graphics_make_color(0,0,0,0xFF));
@@ -463,7 +471,7 @@ int main(int argc, char *argv[])
 					fps_display, fps_display / (FRAME_SKIP + 1),
 					prof_68k_pct, prof_vdp_pct, prof_snd_pct);
 				graphics_draw_text(pending_fb, 4, 4, fps_buf);
-				data_cache_hit_writeback(pending_fb->buffer, 320 * 24 * 2);
+#endif
 				display_show(pending_fb);
 				pending_fb = NULL;
 			}
@@ -529,6 +537,7 @@ int main(int argc, char *argv[])
 		 * do the full scanline pipeline. They alternate with FRAME_SKIP=1. */
 		const char *kind = PicoIn.skipFrame ? "SKIP" : "REND";
 
+#ifdef N64_PERF_HUD
 		debugf("[F] %s ft=%u.%ums cpu:%u vdp:%u[L%uS%uF%u] snd:%u tot:%u aud:%s PC:%06x\n",
 			kind,
 			ft_ms_x10/10, ft_ms_x10%10,
@@ -539,6 +548,10 @@ int main(int argc, char *argv[])
 			(snd_latest_fill == 0) ? "drain"
 				: (snd_latest_fill >= AUDIO_NUM_BUFFERS) ? "full" : "ok",
 			(unsigned)SekPc & 0xFFFFFF);
+#else
+		(void)kind; (void)lp; (void)sp; (void)fp; (void)cpu_pct100; (void)draw_pct100;
+		(void)snd_pct100; (void)total_pct100; (void)ft_ms_x10;
+#endif
 		(void)inst_fps_x10;
 
 		/* Accumulate for per-second summary. */
@@ -674,7 +687,7 @@ int main(int argc, char *argv[])
 #else
 				rspq_wait();
 #endif
-				data_cache_hit_invalidate(pending_fb->buffer, 320 * 240 * 2);
+#ifdef N64_PERF_HUD
 				graphics_set_color(
 					graphics_make_color(0xFF,0xFF,0xFF,0xFF),
 					graphics_make_color(0,0,0,0xFF));
@@ -683,7 +696,7 @@ int main(int argc, char *argv[])
 					fps_display, fps_display / (FRAME_SKIP + 1),
 					prof_68k_pct, prof_vdp_pct, prof_snd_pct);
 				graphics_draw_text(pending_fb, 4, 4, fps_buf);
-				data_cache_hit_writeback(pending_fb->buffer, 320 * 24 * 2);
+#endif
 				display_show(pending_fb);
 				pending_fb = NULL;
 			}
