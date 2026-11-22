@@ -226,6 +226,103 @@ static inline unsigned char picodrive_read(unsigned short a)
 }
 #endif
 
+#if PICODRIVE_HACKS && defined(Z80_DRIVER_ACCEL)
+/* Native fast-forward of a known sound-driver main loop (Gley Lancer's Z80
+ * driver, 0x0023-0x005c), which takes ~80% of all Z80 instructions: per
+ * pass it polls YM timer B and two command bytes from the 68k, then, while
+ * DE != 0, streams one DAC sample from (HL) to YM register 0x2a.
+ *
+ * This executes exactly what Cz80 would, instruction by instruction: same
+ * cycle counts (taken from cz80_op.c) applied at the same points, the same
+ * memory handlers called at the same ICount (so YM timer/busy status, DAC
+ * timestamps and 68k bus delays come out identical), the same flags (SZP),
+ * the same R increments, and the same per-instruction "ICount > 0" stop
+ * rule.  It hands back to Cz80, at the exact instruction, wherever the code
+ * would leave the loop (timer B tick, 68k command, interrupt-enabled CPU) or
+ * the timeslice ends.  Only used when the bytes in Z80 RAM match, except
+ * the delay count at 0x0031 (ld b,N), which the driver rewrites to set the
+ * DAC sample rate.
+ *
+ * Returns the Z80 PC to continue at, or -1 if not applicable (nothing done).
+ */
+static const UINT8 drvacc_code[0x5d - 0x23] = {
+	0x3a,0x00,0x40, 0xe6,0x02, 0x28,0x06, 0xcd,0x36,0x04, 0xc3,0x34,0x00,
+	0x06,0x00, 0x10,0xfe,	/* 0x0031: delay count, not compared */
+	0x3a,0xff,0x1f, 0xb7, 0xc4,0xdc,0x01,
+	0x3a,0xf8,0x1f, 0xb7, 0xc4,0xaa,0x01, 0x7a, 0xb3, 0x28,0xdd,
+	0x06,0x2a, 0x4e, 0x23, 0x3a,0x00,0x40, 0xe6,0x80, 0x20,0xf9, 0x78,
+	0x32,0x00,0x40, 0x79, 0x32,0x01,0x40, 0x1b, 0xc3,0x23,0x00
+};
+
+static INT32 z80_driver_accel(cz80_struc *CPU)
+{
+	UINT32 n = 0;	/* opcodes fetched, for R */
+	UINT8 *ram;
+
+	/* ICount <= 0 happens after DI/EI (they run the next opcode
+	 * unconditionally): leave that one to Cz80 */
+	if (CPU->ICount <= 0 || CPU->ExtraCycles)
+		return -1;
+	/* a pending maskable interrupt with IFF1 clear is a no-op per opcode */
+	if (CPU->Status && (CPU->Status != CZ80_HAS_INT || zIFF1))
+		return -1;
+	ram = (UINT8 *)CPU->Fetch[0];
+	if (memcmp(ram + 0x23, drvacc_code, 0x31 - 0x23) ||
+	    memcmp(ram + 0x32, drvacc_code + (0x32 - 0x23), 0x5d - 0x32))
+		return -1;
+
+#define DA_RET(pc_)  { zR += n; return pc_; }
+#define DA_STEP(pc_) if (CPU->ICount <= 0) DA_RET(pc_) n++;
+	for (;;)
+	{
+		DA_STEP(0x23) zA = picodrive_read(0x4000); USE_CYCLES(13)	/* ld a,(4000h) */
+		DA_STEP(0x26) zA &= 0x02; zF = SZP[zA] | HF; USE_CYCLES(7)	/* and 02h */
+		DA_STEP(0x28)							/* jr z,0030h */
+		if (!(zF & ZF)) { USE_CYCLES(7) DA_RET(0x2a) }			/* timer B: call 0436h */
+		USE_CYCLES(12)
+		DA_STEP(0x30) zB = ram[0x31]; USE_CYCLES(7)			/* ld b,N */
+		for (;;)
+		{
+			DA_STEP(0x32) USE_CYCLES(1)				/* djnz $ */
+			if (!--zB) { USE_CYCLES(7) break; }
+			USE_CYCLES(12)
+		}
+		DA_STEP(0x34) zA = picodrive_read(0x1fff); USE_CYCLES(13)	/* ld a,(1fffh) */
+		DA_STEP(0x37) zF = SZP[zA]; USE_CYCLES(4)			/* or a */
+		if (!(zF & ZF)) DA_RET(0x38)					/* call nz,01dch */
+		DA_STEP(0x38) USE_CYCLES(10)
+		DA_STEP(0x3b) zA = picodrive_read(0x1ff8); USE_CYCLES(13)	/* ld a,(1ff8h) */
+		DA_STEP(0x3e) zF = SZP[zA]; USE_CYCLES(4)			/* or a */
+		if (!(zF & ZF)) DA_RET(0x3f)					/* call nz,01aah */
+		DA_STEP(0x3f) USE_CYCLES(10)
+		DA_STEP(0x42) zA = zD; USE_CYCLES(4)				/* ld a,d */
+		DA_STEP(0x43) zA |= zE; zF = SZP[zA]; USE_CYCLES(4)		/* or e */
+		DA_STEP(0x44)							/* jr z,0023h */
+		if (zF & ZF) { USE_CYCLES(12) continue; }
+		USE_CYCLES(7)
+		DA_STEP(0x46) zB = 0x2a; USE_CYCLES(7)				/* ld b,2ah */
+		DA_STEP(0x48) zC = picodrive_read(zHL); USE_CYCLES(7)		/* ld c,(hl) */
+		DA_STEP(0x49) zHL++; USE_CYCLES(6)				/* inc hl */
+		for (;;)
+		{
+			DA_STEP(0x4a) zA = picodrive_read(0x4000); USE_CYCLES(13) /* ld a,(4000h) */
+			DA_STEP(0x4d) zA &= 0x80; zF = SZP[zA] | HF; USE_CYCLES(7) /* and 80h */
+			DA_STEP(0x4f)						/* jr nz,004ah */
+			if (zF & ZF) { USE_CYCLES(7) break; }
+			USE_CYCLES(12)
+		}
+		DA_STEP(0x51) zA = zB; USE_CYCLES(4)				/* ld a,b */
+		DA_STEP(0x52) WRITE_MEM8(0x4000, zA); USE_CYCLES(13)		/* ld (4000h),a */
+		DA_STEP(0x55) zA = zC; USE_CYCLES(4)				/* ld a,c */
+		DA_STEP(0x56) WRITE_MEM8(0x4001, zA); USE_CYCLES(13)		/* ld (4001h),a */
+		DA_STEP(0x59) zDE--; USE_CYCLES(6)				/* dec de */
+		DA_STEP(0x5a) USE_CYCLES(10)					/* jp 0023h */
+	}
+#undef DA_STEP
+#undef DA_RET
+}
+#endif
+
 /*--------------------------------------------------------
 	CPUŽÀs
 --------------------------------------------------------*/
@@ -277,6 +374,17 @@ Cz80_Exec:
 	if (CPU->ICount > 0)
 	{
 Cz80_Exec_nocheck:
+#if PICODRIVE_HACKS && defined(Z80_DRIVER_ACCEL)
+		if (PC == CPU->Fetch[0] + 0x23)
+		{
+			INT32 npc = z80_driver_accel(CPU);
+			if (npc >= 0)
+			{
+				SET_PC(npc);
+				goto Cz80_Exec;
+			}
+		}
+#endif
 		data = pzHL;
 #ifdef Z80_PCHIST
 		{ extern unsigned int z80_pchist[0x2000]; z80_pchist[zRealPC & 0x1fff]++; }

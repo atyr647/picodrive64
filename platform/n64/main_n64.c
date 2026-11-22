@@ -176,6 +176,21 @@ static unsigned int bench_pad(unsigned int f)
 	return pad;
 }
 
+#ifdef FAME_PCHIST
+unsigned int m68k_pchist[0x88000];
+static void m68k_pchist_dump(void)
+{
+	unsigned long long tot = 0;
+	for (int i = 0; i < 0x88000; i++) tot += m68k_pchist[i];
+	unsigned int thr = (unsigned int)(tot / 2000);
+	debugf("[MHBEGIN] total=%llu thr=%u\n", tot, thr);
+	for (int i = 0; i < 0x88000; i++)
+		if (m68k_pchist[i] > thr)
+			debugf("[MH] %06x %u\n", i < 0x80000 ? i * 2 : 0xff0000 + (i - 0x80000) * 2, m68k_pchist[i]);
+	debugf("[MHEND]\n");
+}
+#endif
+
 #ifdef Z80_PCHIST
 unsigned int z80_pchist[0x2000];
 static void z80_pchist_dump(void)
@@ -191,6 +206,16 @@ static void z80_pchist_dump(void)
 		for (int j = 0; j < 32; j++) n += sprintf(ln + n, "%02x", PicoMem.zram[i + j]);
 		debugf("[ZRAM] %04x %s\n", i, ln);
 	}
+}
+#endif
+
+#ifndef N64_PERF_HUD
+/* CPU-path blit completion, from the RDP SYNC_FULL interrupt */
+static volatile int blit_busy;
+static void blit_done(void *fb)
+{
+	display_show((surface_t *)fb);
+	blit_busy = 0;
 }
 #endif
 
@@ -428,6 +453,20 @@ int main(int argc, char *argv[])
 
 	for (;;) {
 		PicoIn.skipFrame = (frame_count < FRAME_SKIP) ? 1 : 0;
+#ifndef N64_PERF_HUD
+		/* The blit queued on the last rendered frame reads screen_buffer
+		 * and the palette; don't draw into them until the RDP is done.
+		 * (Practically never waits: a skip frame ran in between.) */
+		if (!PicoIn.skipFrame && blit_busy) {
+#ifdef N64_BENCH
+			unsigned int _bt = timer_ticks();
+			while (blit_busy) {}
+			bench_blitwait_ticks += timer_ticks() - _bt;
+#else
+			while (blit_busy) {}
+#endif
+		}
+#endif
 
 		prof_68k_ticks = prof_vdp_ticks = 0;
 		prof_vdp_layer_ticks = prof_vdp_sprite_ticks = prof_vdp_final_ticks = 0;
@@ -681,15 +720,12 @@ int main(int argc, char *argv[])
 			if (n64_use_rdp_tiles)
 				goto post_render;
 
-			/* Finish previous RDP blit (ran during skip frame) */
-			if (pending_fb) {
-#ifdef N64_BENCH
-				{ unsigned int _bt = timer_ticks(); rspq_wait();
-				  bench_blitwait_ticks += timer_ticks() - _bt; }
-#else
-				rspq_wait();
-#endif
 #ifdef N64_PERF_HUD
+			/* Finish previous RDP blit (ran during skip frame), draw the
+			 * HUD text into it and show it.  rspq_wait() also waits for
+			 * the FM job queued this frame; the non-HUD path avoids that. */
+			if (pending_fb) {
+				rspq_wait();
 				graphics_set_color(
 					graphics_make_color(0xFF,0xFF,0xFF,0xFF),
 					graphics_make_color(0,0,0,0xFF));
@@ -698,10 +734,10 @@ int main(int argc, char *argv[])
 					fps_display, fps_display / (FRAME_SKIP + 1),
 					prof_68k_pct, prof_vdp_pct, prof_snd_pct);
 				graphics_draw_text(pending_fb, 4, 4, fps_buf);
-#endif
 				display_show(pending_fb);
 				pending_fb = NULL;
 			}
+#endif
 
 			/* Start new RDP blit (non-blocking) */
 			surface_t *fb = display_get();
@@ -762,8 +798,15 @@ int main(int argc, char *argv[])
 				}
 #endif
 
+#ifdef N64_PERF_HUD
 				rdpq_detach();  /* Non-blocking! RDP runs during next skip frame */
 				pending_fb = fb;
+#else
+				/* Non-blocking: the RDP interrupt shows the frame when the
+				 * blit is done (display_get() has 3 buffers to hand out). */
+				blit_busy = 1;
+				rdpq_detach_cb(blit_done, fb);
+#endif
 			}
 post_render: ;
 		}
@@ -832,6 +875,10 @@ post_render: ;
 			if (f == BENCH_START)
 				memset(z80_pchist, 0, sizeof(z80_pchist));
 #endif
+#ifdef FAME_PCHIST
+			if (f == BENCH_START)
+				memset(m68k_pchist, 0, sizeof(m68k_pchist));
+#endif
 #ifdef BENCH_EG_TRACE
 			if (f >= BENCH_START && f <= BENCH_END) {
 				uint32_t eh = 2166136261u;
@@ -859,6 +906,21 @@ post_render: ;
 #ifdef Z80_PCHIST
 				z80_pchist_dump();
 #endif
+#ifdef FAME_PCHIST
+				m68k_pchist_dump();
+#endif
+				{   /* Z80 + YM timer state, to verify Z80-side changes exactly */
+					uint32_t zh = bench_hash(PicoMem.zram, 0x2000, 2166136261u);
+					for (int r = CZ80_PC; r <= CZ80_IRQ; r++) {
+						uint32_t v = Cz80_Get_Reg(&CZ80, r);
+						zh = bench_hash(&v, 4, zh);
+					}
+					int t[] = { Pico.t.z80c_cnt, Pico.t.z80_busdelay, Pico.t.z80_buscycles,
+						Pico.t.timer_a_next_oflow, Pico.t.timer_b_next_oflow, Pico.t.ym2612_busy,
+						ym2612.OPN.ST.status, ym2612.dacout };
+					zh = bench_hash(t, sizeof(t), zh);
+					debugf("[ZSTATE] zhash=%08lx\n", (unsigned long)zh);
+				}
 				uint32_t h = bench_hash(PicoMem.ram, 0x10000, 2166136261u);
 				h = bench_hash(PicoMem.vram, 0x10000, h);
 				unsigned int us = (unsigned int)(TIMER_MICROS_LL(b_ticks) / b_frames);

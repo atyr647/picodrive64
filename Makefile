@@ -290,6 +290,14 @@ N64_HOT_ORDER ?= 1
 ifeq "$(N64_HOT_ORDER)" "1"
 LDFLAGS += -Wl,--section-ordering-file=platform/n64/hot_functions.ld
 endif
+# Exact native fast-forward of the embedded game's Z80 sound-driver main
+# loop (cpu/cz80/cz80.c, z80_driver_accel).  Only engages when Z80 RAM holds
+# that exact code; results are identical to plain Cz80.  Disable with
+# N64_Z80_ACCEL=0.
+N64_Z80_ACCEL ?= 1
+ifeq "$(N64_Z80_ACCEL)" "1"
+CFLAGS += -DZ80_DRIVER_ACCEL
+endif
 # Disable features that won't fit in N64 RAM
 no_32x = 1
 no_sms = 0

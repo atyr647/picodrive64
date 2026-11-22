@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef __GNUC__
 #pragma GCC diagnostic ignored "-Wunused-variable"
@@ -254,8 +255,18 @@
 
 #else
 
+#ifdef FAME_PCHIST
+/* profiling builds only: count executed instructions per 68k word address
+ * (ROM 0-1MB, then 64KB RAM) -- see main_n64.c */
+extern unsigned int m68k_pchist[];
+#define FAME_PCHIST_HOOK { u32 pc_ = (u32)((uintptr_t)PC - (uintptr_t)BasePC) & 0xffffff; \
+    m68k_pchist[pc_ < 0x100000 ? (pc_ >> 1) : 0x80000 + ((pc_ & 0xffff) >> 1)]++; }
+#else
+#define FAME_PCHIST_HOOK
+#endif
 #define NEXT \
     do { \
+        FAME_PCHIST_HOOK \
         FETCH_WORD(Opcode); \
         JumpTable[Opcode](ctx); \
     } while (ctx->io_cycle_counter > 0);
