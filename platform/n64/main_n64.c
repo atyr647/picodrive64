@@ -177,6 +177,10 @@ int main(int argc, char *argv[])
 	g_screen_ptr = screen_buffer;
 
 	debug_init_usblog();
+	/* Also log to an IS-Viewer if one is present: emulators (ares prints
+	 * it to its terminal) -- lets the profiler run headless.  Probes and
+	 * does nothing if there's no IS-Viewer. */
+	debug_init_isviewer();
 	display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_RESAMPLE);
 	rdpq_init();
 	audio_init(SND_RATE, 4);

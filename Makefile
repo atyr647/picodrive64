@@ -292,9 +292,16 @@ use_sh2drc = 0
 use_svpdrc = 0
 # Experimental 68k->MIPS DRC (cpu/drc/drc68k.c).  This was "= 1" but never
 # actually ran: common.mak only added the source file and did not define
-# DRC_68K, so the 68k was 100% FAME.  Now that the define is wired it would
-# switch on never-before-run JIT code, so keep it opt-in until it has been
-# validated:   make DRC_68K=1 ...   (profiler prints a [DRC] line when on)
+# DRC_68K, so the 68k was 100% FAME.  Opt-in:  make DRC_68K=1 ...
+# (the profiler then prints a [DRC] line).  Switching it requires
+# `make clean N64_EMBEDDED_ROM=1` -- make does not track defines.
+#
+# Measured on ares (Gley Lancer intro, platform/n64/tools/ares_profile.sh):
+# it is a net LOSS.  ~0.1% of 68k cycles run native -- blocks starting with
+# TST.L / CMPA / 1-insn Bcc don't compile, and any FAME fallback runs the
+# rest of the timeslice -- while 68k time rises from ~48% to ~64% of a frame
+# (lookup overhead alone ~+5: the 8KB direct-mapped D-cache; executing the
+# few compiled blocks costs the rest).  Leave off until it's redesigned.
 DRC_68K ?= 0
 # RSP palette converter (unused - RDP blit replaced it)
 #OBJS += platform/n64/rsp_tiles.o platform/n64/rsp_render.o
