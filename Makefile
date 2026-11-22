@@ -282,12 +282,13 @@ LDFLAGS += -Wl,--defsym=rsp_fm_meta_start=0,--defsym=rsp_fm_meta_end=0
 # collide at link.  Allow the duplicates; they're functionally
 # identical implementations of the newlib retarget interface.
 LDFLAGS += -Wl,-z,muldefs
-# Profile-guided function order: hottest functions first in .text (see
-# platform/n64/tools/make_ordering.py).  Packs the hot set together for the
-# 16KB direct-mapped I-cache and keeps its layout stable across unrelated
-# code changes.  Disable with N64_HOT_ORDER=0.
+# Cache-colored code and data placement (platform/n64/layout.ld, generated
+# by platform/n64/tools/layout/, see README there): pins each hot function to
+# an I-cache position and each hot data object to a D-cache position chosen
+# by simulating the direct-mapped caches over traced gameplay.  Disable with
+# N64_HOT_ORDER=0; N64_ORDER_FILE selects another ordering file.
 N64_HOT_ORDER ?= 1
-N64_ORDER_FILE ?= platform/n64/hot_functions.ld
+N64_ORDER_FILE ?= platform/n64/layout.ld
 ifeq "$(N64_HOT_ORDER)" "1"
 LDFLAGS += -Wl,--section-ordering-file=$(N64_ORDER_FILE)
 endif

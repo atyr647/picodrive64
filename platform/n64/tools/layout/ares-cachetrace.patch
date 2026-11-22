@@ -1,0 +1,199 @@
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index 41964d4..af7889d 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -189,6 +189,8 @@ auto CPU::instructionPrologue(u64 address, u32 instruction) -> void {
+ }
+ 
+ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
++  profile.icacheMisses++;
++  missHist.rec(missHist.ipc, (vaddr & 0x7fffff) >> 2);
+   icache.line(vaddr).fill(paddr, *this);
+ }
+ 
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index b51000d..d33631b 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -141,6 +141,31 @@ struct CPU : Thread {
+     u32  segment[8];  //512_MiB chunks
+   } context{*this};
+ 
++  //miss histograms (emux XPROF 6 = reset+enable, 7 = dump)
++  struct MissHist {
++    bool on = false;
++    std::vector<u32> ipc, dpc, dline, wbline;
++    auto rec(std::vector<u32>& v, u64 i) -> void { if(on && i < v.size()) v[i]++; }
++    //fetch/data-access traces (XPROF 8 = start, 9 = stop): interpreter only
++    FILE* itrace = nullptr; FILE* dtrace = nullptr; u32 ilast = ~0u, istart = 0, ilen = 0;
++    bool wasJit = false;
++    //sequential fetch runs: (start vaddr, instruction count)
++    auto itr(u64 vaddr) -> void {
++      u32 v = (u32)vaddr;
++      if(v == ilast + 4 && ilen) { ilast = v; ilen++; return; }
++      iflush();
++      istart = ilast = v; ilen = 1;
++    }
++    auto iflush() -> void {
++      if(ilen) { u32 r[2] = { istart, ilen }; fwrite(r, 4, 2, itrace); }
++      ilen = 0;
++    }
++    auto dtr(u32 paddr, bool w) -> void {
++      u32 v = (paddr & 0x7fffffffu) | (w ? 0x80000000u : 0);
++      fwrite(&v, 4, 1, dtrace);
++    }
++  } missHist;
++
+   //icache.cpp
+   struct InstructionCache {
+     CPU& self;
+@@ -152,6 +177,7 @@ struct CPU : Thread {
+       auto& line = this->line(vaddr);
+       if(!line.hit(paddr)) {
+         self.profile.icacheMisses++;
++        self.missHist.rec(self.missHist.ipc, (vaddr & 0x7fffff) >> 2);
+         line.fill(paddr, cpu);
+       } else {
+         self.profile.icacheHits++;
+@@ -160,9 +186,11 @@ struct CPU : Thread {
+ 
+     //used by the interpreter to fully emulate the instruction cache
+     auto fetch(u64 vaddr, u32 paddr, CPU& cpu) -> u32 {
++      if(self.missHist.itrace) self.missHist.itr(vaddr);
+       auto& line = this->line(vaddr);
+       if(!line.hit(paddr)) {
+         self.profile.icacheMisses++;
++        self.missHist.rec(self.missHist.ipc, (vaddr & 0x7fffff) >> 2);
+         line.fill(paddr, cpu);
+       } else {
+         self.profile.icacheHits++;
+@@ -352,6 +380,7 @@ struct CPU : Thread {
+   auto jitIcacheFillMiss(u64 vaddr, u32 paddr) -> void {
+     auto& line = icache.line(vaddr);
+     profile.icacheMisses++;
++    missHist.rec(missHist.ipc, (vaddr & 0x7fffff) >> 2);
+     line.fill(paddr, *this);
+   }
+   template<u32 Size> auto busWrite(u32 address, u64 data) -> void;
+@@ -1324,6 +1353,7 @@ struct CPU : Thread {
+   auto XLOG(cr64& rd, cr64& rt, u64 code) -> void;
+   auto XHEXDUMP(cr64& rd, cr64& rt) -> void;
+   auto XPROF(cr64& rd, u64 code) -> void;
++  auto missHistCommand(u64 code) -> void;
+   auto XPROFREAD(cr64& rd, r64& rt) -> void;
+   auto XEXCEPTION(r64& rt) -> void;
+   auto XIOCTL(u64 code) -> void;
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index 4de28e0..1a3bb85 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -49,14 +49,18 @@ auto CPU::DataCache::Line::write(u32 paddr, u64 data) -> void {
+ 
+ template<u32 Size>
+ auto CPU::DataCache::read(u64 vaddr, u32 paddr) -> u64 {
++  if(self.missHist.dtrace) self.missHist.dtr(paddr, false);
+   auto& line = this->line(vaddr);
+   if(!line.hit(paddr)) {
+     if(line.valid() && line.dirty) {
++      self.missHist.rec(self.missHist.wbline, ((line.tagKey & ~0xfffu) | (vaddr & 0xff0)) >> 4 & 0x7ffff);
+       line.writeBack();
+       self.profile.dcacheWritebacks++;
+     }
+     line.fill(paddr);
+     self.profile.dcacheMisses++;
++    self.missHist.rec(self.missHist.dpc, (self.ipu.pc & 0x7fffff) >> 2);
++    self.missHist.rec(self.missHist.dline, (paddr & 0x7fffff) >> 4);
+   } else {
+     cpu.step(1 * 2);
+     self.profile.dcacheHits++;
+@@ -78,14 +82,18 @@ auto CPU::DataCache::readDebug(u64 vaddr, u32 paddr) -> u64 {
+ 
+ template<u32 Size>
+ auto CPU::DataCache::write(u64 vaddr, u32 paddr, u64 data) -> void {
++  if(self.missHist.dtrace) self.missHist.dtr(paddr, true);
+   auto& line = this->line(vaddr);
+   if(!line.hit(paddr)) {
+     if(line.valid() && line.dirty) {
++      self.missHist.rec(self.missHist.wbline, ((line.tagKey & ~0xfffu) | (vaddr & 0xff0)) >> 4 & 0x7ffff);
+       line.writeBack();
+       self.profile.dcacheWritebacks++;
+     }
+     line.fill(paddr);
+     self.profile.dcacheMisses++;
++    self.missHist.rec(self.missHist.dpc, (self.ipu.pc & 0x7fffff) >> 2);
++    self.missHist.rec(self.missHist.dline, (paddr & 0x7fffff) >> 4);
+   } else {
+     cpu.step(1 * 2);
+     self.profile.dcacheHits++;
+diff --git a/ares/n64/cpu/emux.cpp b/ares/n64/cpu/emux.cpp
+index e9dc54e..4c64061 100644
+--- a/ares/n64/cpu/emux.cpp
++++ b/ares/n64/cpu/emux.cpp
+@@ -90,6 +90,7 @@ auto CPU::XPROF(cr64& rd, u64 code) -> void {
+         profileSlots.clear();
+         return;
+     }
++    if(code >= 6 && code <= 9) { missHistCommand(code); return; }
+ 
+     u64 slot = rd.u64;
+     if (slot >= 1024) return;
+@@ -129,6 +130,46 @@ auto CPU::XPROF(cr64& rd, u64 code) -> void {
+     }
+ }
+ 
++auto CPU::missHistCommand(u64 code) -> void {
++  if(code == 8 && !missHist.itrace) {
++    const char* p = getenv("ARES_TRACE");
++    string base = p ? p : "/tmp/ares_trace";
++    missHist.itrace = fopen(string{base, ".i"}, "wb");
++    missHist.dtrace = fopen(string{base, ".d"}, "wb");
++    missHist.ilast = ~0u; missHist.ilen = 0;
++    missHist.wasJit = recompiler.enabled;
++    recompiler.enabled = false;   //interpreter: every fetch goes through icache.fetch
++  }
++  if(code == 9 && missHist.itrace) {
++    missHist.iflush();
++    fclose(missHist.itrace); fclose(missHist.dtrace);
++    missHist.itrace = missHist.dtrace = nullptr;
++    recompiler.enabled = missHist.wasJit;
++  }
++  if(code == 6) {
++    missHist.ipc.assign(1 << 21, 0);
++    missHist.dpc.assign(1 << 21, 0);
++    missHist.dline.assign(1 << 19, 0);
++    missHist.wbline.assign(1 << 19, 0);
++    missHist.on = true;
++  }
++  if(code == 7 && missHist.on) {
++    missHist.on = false;
++    const char* path = getenv("ARES_MISSHIST");
++    FILE* f = fopen(path ? path : "/tmp/ares_misshist.txt", "w");
++    if(!f) return;
++    for(u32 i = 0; i < missHist.ipc.size(); i++)
++      if(missHist.ipc[i]) fprintf(f, "I %08x %u\n", 0x80000000u | (i << 2), missHist.ipc[i]);
++    for(u32 i = 0; i < missHist.dpc.size(); i++)
++      if(missHist.dpc[i]) fprintf(f, "DP %08x %u\n", 0x80000000u | (i << 2), missHist.dpc[i]);
++    for(u32 i = 0; i < missHist.dline.size(); i++)
++      if(missHist.dline[i]) fprintf(f, "DL %08x %u\n", 0x80000000u | (i << 4), missHist.dline[i]);
++    for(u32 i = 0; i < missHist.wbline.size(); i++)
++      if(missHist.wbline[i]) fprintf(f, "WB %08x %u\n", 0x80000000u | (i << 4), missHist.wbline[i]);
++    fclose(f);
++  }
++}
++
+ auto CPU::XPROFREAD(cr64& rd, r64& rt) -> void {
+   if(!system.homebrewMode) return;
+ 
+diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
+index b84272a..a032eb9 100644
+--- a/ares/n64/cpu/recompiler.cpp
++++ b/ares/n64/cpu/recompiler.cpp
+@@ -812,7 +812,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+       const u32 burst = (slow.icachePaddr & ~0xfffu) | ((lineIndex << 5) & 0xfe0u);
+       const u32 tagKey = (slow.icachePaddr & ~0xfffu) | 1u;
+       const bool sdram = Model::Aleck64() && burst > 0xbfff'ffffu;
+-      if(!emitStateKey.rdramMapIdentity() || (!sdram && burst + 0x1f >= rdram.ram.size)) {
++      if(system.homebrewMode || !emitStateKey.rdramMapIdentity() || (!sdram && burst + 0x1f >= rdram.ram.size)) {
+         callf(&CPU::icacheFillLine, imm64(slow.vaddr), imm(slow.icachePaddr));
+       } else {
+         const sljit_sw ramDataField = sdram ? (sljit_sw)(uintptr_t)&aleck64.sdram.data

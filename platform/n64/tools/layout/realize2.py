@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""realize2.py --text SECS COLORS [--data DOBJS DMAP DCOLORS] OUT.ld   (env ALIGN_FILE)
+
+Emit a --section-ordering-file that pins hot .text sections to I-cache colors
+(16KB/32B) and hot data objects to D-cache colors (8KB/16B).  Before each hot
+entry a padding statement moves the location counter to the exact color, so a
+placement never depends on predicted sizes; cold sections are used as fillers
+first so little space is wasted (a safety margin absorbs prediction errors)."""
+import sys, re, bisect, os
+from collections import defaultdict
+
+args = sys.argv[1:]
+out_ld = args[-1]
+ALIGN = {}
+if os.environ.get('ALIGN_FILE'):
+    for l in open(os.environ['ALIGN_FILE']):
+        lo_, hi_, n_ = l.split(); ALIGN[n_] = int(lo_)
+
+def realize(entries, hot_color, page, line, base, margin, default_align, padfmt):
+    """entries: list of (name, size, pattern, orig_addr); returns list of script lines and stats"""
+    def al(n):
+        return ALIGN.get(n, default_align(n))
+    hot = [e for e in entries if e[0] in hot_color]
+    cold = [e for e in entries if e[0] not in hot_color and e[2]]
+    cold.sort(key=lambda e: e[3])
+    sizes = sorted(range(len(cold)), key=lambda i: cold[i][1])
+    avail = list(sizes); avail_sz = [cold[i][1] for i in avail]
+    out = []; pos = base; pad_total = 0
+    def place(p, e):
+        a = al(e[0]); p = (p + a - 1) & ~(a - 1); return p, p + e[1]
+    hot.sort(key=lambda e: hot_color[e[0]])
+    pending = list(hot)
+    while pending:
+        off = pos % page
+        cand = [e for e in pending if hot_color[e[0]] * line >= off + margin]
+        e = cand[0] if cand else pending[0]
+        target = pos - off + hot_color[e[0]] * line + (0 if cand else page)
+        # fill with cold entries up to target - margin
+        tries = 0
+        while avail and target - margin - pos >= 4 and tries < 3000:
+            j = bisect.bisect_right(avail_sz, target - margin - pos) - 1
+            ok = False
+            while j >= 0 and tries < 3000:
+                tries += 1
+                ce = cold[avail[j]]
+                st, en = place(pos, ce)
+                if en <= target - margin:
+                    out.append('  %s' % ce[2]); pos = en
+                    avail.pop(j); avail_sz.pop(j); ok = True; break
+                j -= 1
+            if not ok: break
+        pad_total += target - pos
+        out.append('  ' + padfmt(hot_color[e[0]] * line))
+        out.append('  %s' % e[2])
+        pos = target + e[1]
+        pending.remove(e)
+    return out, pad_total, pos - base
+
+blocks = []
+if '--text' in args:
+    i = args.index('--text'); secs_f, colors_f = args[i + 1], args[i + 2]
+    entries = []
+    for l in open(secs_f):
+        p = l.split(); a, sz, n, fl = int(p[0], 16), int(p[1]), p[2], p[3]
+        if n == '.text':
+            m = re.match(r'.*/(lib[^/]+\.a)\(([^)]+)\)$', fl)
+            n = '.text@' + fl
+            pat = '*%s:%s(.text)' % (m.group(1), m.group(2)) if m else None
+        else:
+            pat = '*(%s)' % n
+        entries.append((n, sz, pat, a))
+    hc = {}
+    for l in open(colors_f):
+        c, sz, heat, name = l.split()[:4]; hc[name] = int(c)
+    lines, pad, span = realize(entries, hc, 16384, 32, 0x80000400, 64,
+                               lambda n: 16 if n.startswith('.text@') else 4,
+                               # .text starts at 0x80000400 (n64.ld); '.' is section-relative
+                               lambda t: '. += (0x%x - .) & 0x3fff;' % ((t - 0x400) & 0x3fff))
+    blocks.append(('.text', lines))
+    print('text: %d entries, padding %d B, ordered span %d KB' % (len(lines), pad, span // 1024))
+if '--data' in args:
+    i = args.index('--data'); dobj_f, dmap_f, dcol_f = args[i + 1], args[i + 2], args[i + 3]
+    # input sections of the data output sections, from map_data.py output of the traced build
+    secmap = {}
+    for l in open(dmap_f):
+        a, sz, n, osec, fl = l.split(); secmap.setdefault(osec, []).append((n, int(sz), int(a, 16)))
+    dc = {}
+    for l in open(dcol_f):
+        c, sz, heat, t, name = l.split(); dc[name] = int(c)
+    for osec in ('.data', '.rodata', '.bss'):
+        ents = []
+        hcol = {}
+        for n, sz, a in secmap.get(osec, []):
+            sym = re.sub(r'^\.(data|rodata|bss)\.', '', n)
+            ents.append((n, sz, '*(%s)' % n, a))
+            if sym in dc:
+                hcol[n] = dc[sym]
+        if not hcol:
+            continue
+        sym = '__hot%s_base' % osec.replace('.', '_')
+        lines, pad, span = realize(ents, hcol, 8192, 16, 0, 32, lambda n: 8,
+                                   lambda t, sym=sym: '. += (0x%x - (. - %s)) & 0x1fff;' % (t & 0x1fff, sym))
+        blocks.append((osec, ['  . = ALIGN(8192);', '  %s = .;' % sym] + lines))
+        print('%s: %d hot objects, padding %d B, span %d KB' % (osec, len(hcol), pad, span // 1024))
+with open(out_ld, 'w') as f:
+    f.write('/* generated by realize2.py: I$/D$ colored placement, see platform/n64/tools/README-layout.md */\n')
+    for osec, lines in blocks:
+        f.write('%s : {\n%s\n}\n' % (osec, '\n'.join(lines)))
