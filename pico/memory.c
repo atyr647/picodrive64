@@ -1409,6 +1409,18 @@ static int ym2612_write_local(u32 a, u32 d, int is_from_z80)
 }
 
 
+/* For the Z80 driver-loop fast-forward (cpu/cz80/cz80.c): the first Z80
+ * cycle (Q8, as ym2612_update_status() compares) at which a status read
+ * returns the timer B flag set; 0 if it already is (sticky). */
+int ym2612_timer_b_flag_from(void)
+{
+  if (ym2612.OPN.ST.status & 2)
+    return 0;
+  if (!((ym2612.OPN.ST.mode >> 2) & 2))
+    return 0x7fffffff;
+  return Pico.t.timer_b_next_oflow;
+}
+
 static u32 ym2612_read_local_z80(void)
 {
   int xcycles = z80_cyclesDone() << 8;
