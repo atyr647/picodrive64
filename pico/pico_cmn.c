@@ -25,7 +25,7 @@ extern unsigned int prof_vdp_ticks;
 extern unsigned int prof_vdp_layer_ticks;
 extern unsigned int prof_vdp_sprite_ticks;
 extern unsigned int prof_vdp_final_ticks;
-#if defined(N64_PERF_HUD) || defined(N64_BENCH)
+#if defined(N64_PERF_HUD) || defined(N64_BENCH_TIMERS)
 #define PROF_START() unsigned int _pt = timer_ticks()
 #define PROF_68K()   do { prof_68k_ticks += timer_ticks() - _pt; _pt = timer_ticks(); } while(0)
 #define PROF_VDP()   do { prof_vdp_ticks += timer_ticks() - _pt; _pt = timer_ticks(); } while(0)
@@ -80,7 +80,14 @@ static void SekExecM68k(int cyc_do)
     }
   }
 #else
+#ifdef N64_EMUX
+  { extern int emux_in68k; extern unsigned int emux_fame_calls;
+    emux_in68k = 1; emux_fame_calls++; EMUX_START(5);
   Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, cyc_do, 0) - cyc_do;
+    EMUX_STOP(5); emux_in68k = 0; }
+#else
+  Pico.t.m68c_cnt += fm68k_emulate(&PicoCpuFM68k, cyc_do, 0) - cyc_do;
+#endif
 #endif
 #endif
   SekCyclesLeft = 0;

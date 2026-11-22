@@ -287,13 +287,18 @@ LDFLAGS += -Wl,-z,muldefs
 # 16KB direct-mapped I-cache and keeps its layout stable across unrelated
 # code changes.  Disable with N64_HOT_ORDER=0.
 N64_HOT_ORDER ?= 1
+N64_ORDER_FILE ?= platform/n64/hot_functions.ld
 ifeq "$(N64_HOT_ORDER)" "1"
-LDFLAGS += -Wl,--section-ordering-file=platform/n64/hot_functions.ld
+LDFLAGS += -Wl,--section-ordering-file=$(N64_ORDER_FILE)
 endif
 # Exact native fast-forward of the embedded game's Z80 sound-driver main
 # loop (cpu/cz80/cz80.c, z80_driver_accel).  Only engages when Z80 RAM holds
 # that exact code; results are identical to plain Cz80.  Disable with
 # N64_Z80_ACCEL=0.
+# Benchmark/trace support is always compiled in and only runs from a dev ROM
+# (platform/n64/tools/make_dev_rom.sh), so dev and release ROMs share code
+# and code layout.
+CFLAGS += -DN64_BENCH
 N64_Z80_ACCEL ?= 1
 ifeq "$(N64_Z80_ACCEL)" "1"
 CFLAGS += -DZ80_DRIVER_ACCEL

@@ -1992,7 +1992,7 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 		/* Mix in the PREVIOUS frame's FM output (normally complete by now) */
 		if (have_prev) {
 			int n = fm_len[prev];
-#ifdef N64_BENCH
+#ifdef N64_BENCH_TIMERS
 			{ extern unsigned int bench_fmwait_ticks; unsigned int _bt = timer_ticks();
 			rspq_syncpoint_wait(fm_sync[prev]);
 			bench_fmwait_ticks += timer_ticks() - _bt;

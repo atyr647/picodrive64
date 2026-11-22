@@ -261,6 +261,9 @@
 extern unsigned int m68k_pchist[];
 #define FAME_PCHIST_HOOK { u32 pc_ = (u32)((uintptr_t)PC - (uintptr_t)BasePC) & 0xffffff; \
     m68k_pchist[pc_ < 0x100000 ? (pc_ >> 1) : 0x80000 + ((pc_ & 0xffff) >> 1)]++; }
+#elif defined(N64_EMUX_ICOUNT)
+extern unsigned int emux_fame_instrs;
+#define FAME_PCHIST_HOOK emux_fame_instrs++;
 #else
 #define FAME_PCHIST_HOOK
 #endif

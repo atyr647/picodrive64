@@ -15,6 +15,13 @@
 
 #include "sound/ym2612.h"
 #include "sound/sn76496.h"
+#ifdef N64
+#include "../platform/n64/emux.h"
+#endif
+#ifndef EMUX_START
+#define EMUX_START(s)
+#define EMUX_STOP(s)
+#endif
 
 extern unsigned int lastSSRamWrite; // used by serial eeprom code
 
@@ -1028,8 +1035,13 @@ u32 PicoRead8_vdp(u32 a)
 
 static u32 PicoRead16_vdp(u32 a)
 {
-  if ((a & 0x00e0) == 0x0000)
-    return PicoVideoRead(a);
+  if ((a & 0x00e0) == 0x0000) {
+    u32 d;
+    EMUX_START(7);
+    d = PicoVideoRead(a);
+    EMUX_STOP(7);
+    return d;
+  }
 
   elprintf(EL_UIO|EL_ANOMALY, "68k bad read [%06x] @%06x", a, SekPc);
   return 0;
@@ -1057,7 +1069,9 @@ static void PicoWrite16_vdp(u32 a, u32 d)
     return;
   }
   if ((a & 0x00e0) == 0x0000) {
+    EMUX_START(6);
     PicoVideoWrite(a, d);
+    EMUX_STOP(6);
     return;
   }
 

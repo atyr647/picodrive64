@@ -9,7 +9,7 @@
 
 #include "pico_int.h"
 
-#if defined(N64) && (defined(N64_PERF_HUD) || defined(N64_BENCH))
+#if defined(N64) && (defined(N64_PERF_HUD) || defined(N64_BENCH_TIMERS))
 #include <libdragon.h>
 extern unsigned int prof_vdp_sprite_ticks;
 extern unsigned int prof_vdp_layer_ticks;

@@ -6,6 +6,7 @@
  * bits 20-24, rt at 15-19, code at 6-14.
  *
  *   emux_prof(slot, 1/2)   start/stop accumulating into profile slot
+ *   emux_clear(slot)       zero a (stopped) slot
  *   emux_profread(slot, k) read a counter of a slot:
  *       0x0000 CPU cycles   0x0010 I$ hits   0x0011 I$ misses
  *       0x0020 D$ hits      0x0021 D$ misses 0x0022 D$ writebacks
@@ -28,6 +29,13 @@ static inline unsigned long long emux_profread(unsigned int slot, unsigned int w
 	__asm__ volatile(".word 0x42410029" : "+r"(v0) : "r"(a0) : "memory"); /* XPROFREAD $4,$2 */
 	return v0;
 }
+static inline void emux_clear(unsigned int slot)
+{
+	register unsigned int a0 __asm__("$4") = slot;
+	__asm__ volatile(".word 0x424000e8" :: "r"(a0) : "memory"); /* XPROF $4, 3 */
+}
+#endif
+#ifdef N64_EMUX
 #define EMUX_START(s) emux_prof((s), 1)
 #define EMUX_STOP(s)  emux_prof((s), 0)
 #else

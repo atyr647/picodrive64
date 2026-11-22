@@ -74,6 +74,41 @@ static uint8_t __attribute__((aligned(16))) screen_buffer[328 * 240];
 #define SND_RATE 11025
 static short __attribute__((aligned(8))) snd_buffer[SND_RATE / 50 + 16];
 /* Upmix buffer: mono -> stereo for libdragon (which requires stereo) */
+/* ---- Developer config ----
+ * Bench/trace support is compiled into every build so that the code (and,
+ * through LTO, the layout of everything else) is identical to the release
+ * ROM; it only runs if the ROM carries a "*.pdcfg" rompak file, which
+ * platform/n64/tools/make_dev_rom.sh adds when packaging a dev ROM from
+ * the same ELF.  A normal ROM has none, so none of it ever runs.  The
+ * trace/miss-histogram hooks are ares emux instructions (reserved on real
+ * hardware): only enable those for ares. */
+#define DEV_BENCH     1   /* scripted input, [BENCH] timing + state hashes */
+#define DEV_TRACE     2   /* ares (patched): I/D trace of a frame window */
+#define DEV_MISSHIST  4   /* ares (patched): cache-miss histograms */
+static struct { uint32_t flags, trace_start, trace_frames, reserved; } devcfg;
+extern uint32_t rompak_search_ext(const char *ext, size_t *size);
+static void devcfg_load(void)
+{
+	size_t sz = 0;
+	uint32_t a = rompak_search_ext(".pdcfg", &sz);
+	if (!a || sz < 16)
+		return;
+	devcfg.flags = io_read(a);
+	devcfg.trace_start = io_read(a + 4);
+	devcfg.trace_frames = io_read(a + 8);
+}
+static inline void dev_xprof(unsigned int code)
+{
+	/* ares emux XPROF $4, code (6/7 miss histogram, 8/9 trace) */
+	register unsigned int a0 __asm__("$4") = 0;
+	switch (code) {
+	case 6: __asm__ volatile(".word 0x424001a8" :: "r"(a0) : "memory"); break;
+	case 7: __asm__ volatile(".word 0x424001e8" :: "r"(a0) : "memory"); break;
+	case 8: __asm__ volatile(".word 0x42400228" :: "r"(a0) : "memory"); break;
+	case 9: __asm__ volatile(".word 0x42400268" :: "r"(a0) : "memory"); break;
+	}
+}
+
 static short __attribute__((aligned(8))) snd_stereo[2 * (SND_RATE / 50 + 16)];
 
 /* Audio health tracking.
@@ -111,7 +146,7 @@ static void write_sound(int len)
 	snd_latest_fill = (unsigned)(AUDIO_NUM_BUFFERS - free_bufs);
 	snd_total_samples += nsamples;
 #ifdef N64_BENCH
-	{
+	if (devcfg.flags & DEV_BENCH) {
 		extern uint32_t bench_audio_hash; extern unsigned int bench_audio_n;
 		const uint8_t *b = (const uint8_t *)snd_buffer;
 		for (int i = 0; i < nsamples * 2; i++)
@@ -124,15 +159,24 @@ static void write_sound(int len)
 #endif
 	}
 #endif
-#ifdef N64_BENCH
 	/* Never wait on the audio DAC in benchmark mode: measure raw
 	 * throughput even when emulation runs faster than real time. */
-	if (free_bufs > 0)
-		audio_push(snd_stereo, nsamples, false);
-#else
-	audio_push(snd_stereo, nsamples, true);
-#endif
+	if (devcfg.flags & DEV_BENCH) {
+		if (free_bufs > 0)
+			audio_push(snd_stereo, nsamples, false);
+	} else
+		audio_push(snd_stereo, nsamples, true);
 }
+
+#ifndef N64_PERF_HUD
+/* CPU-path blit completion, from the RDP SYNC_FULL interrupt */
+static volatile int blit_busy;
+static void blit_done(void *fb)
+{
+	display_show((surface_t *)fb);
+	blit_busy = 0;
+}
+#endif
 
 #ifdef N64_BENCH
 /* ---- Deterministic benchmark mode (make ... EXTRA_CFLAGS=-DN64_BENCH) ----
@@ -176,6 +220,10 @@ static unsigned int bench_pad(unsigned int f)
 	return pad;
 }
 
+#ifdef N64_EMUX
+int emux_in68k;
+unsigned int emux_fame_calls, emux_fame_instrs;
+#endif
 #ifdef FAME_PCHIST
 unsigned int m68k_pchist[0x88000];
 static void m68k_pchist_dump(void)
@@ -206,16 +254,6 @@ static void z80_pchist_dump(void)
 		for (int j = 0; j < 32; j++) n += sprintf(ln + n, "%02x", PicoMem.zram[i + j]);
 		debugf("[ZRAM] %04x %s\n", i, ln);
 	}
-}
-#endif
-
-#ifndef N64_PERF_HUD
-/* CPU-path blit completion, from the RDP SYNC_FULL interrupt */
-static volatile int blit_busy;
-static void blit_done(void *fb)
-{
-	display_show((surface_t *)fb);
-	blit_busy = 0;
 }
 #endif
 
@@ -355,6 +393,10 @@ int main(int argc, char *argv[])
 	 * it to its terminal) -- lets the profiler run headless.  Probes and
 	 * does nothing if there's no IS-Viewer. */
 	debug_init_isviewer();
+	devcfg_load();
+	if (devcfg.flags)
+		debugf("[DEVCFG] flags=%lx trace=%lu+%lu\n", (unsigned long)devcfg.flags,
+		       (unsigned long)devcfg.trace_start, (unsigned long)devcfg.trace_frames);
 	display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_RESAMPLE);
 	rdpq_init();
 	audio_init(SND_RATE, 4);
@@ -831,7 +873,7 @@ post_render: ;
 		PicoIn.pad[0] = pad;
 
 #ifdef N64_BENCH
-		{
+		if (devcfg.flags & DEV_BENCH) {
 			static unsigned int b_last, b_frames;
 			static uint64_t b_ticks, b_68k, b_vdp;
 			static unsigned int z0t, z0c, fw0, bw0, fs0;
@@ -852,12 +894,31 @@ post_render: ;
 			if (f == BENCH_START)
 				ps_start();
 #endif
+			if (devcfg.flags & DEV_TRACE) {
+				if (f == devcfg.trace_start) dev_xprof(8);
+				if (f == devcfg.trace_start + devcfg.trace_frames) { dev_xprof(9); debugf("[TRACE] done\n"); }
+			}
+			if (devcfg.flags & DEV_MISSHIST) {
+				if (f == devcfg.trace_start) dev_xprof(6);
+				if (f == devcfg.trace_start + devcfg.trace_frames) { dev_xprof(7); debugf("[MISSHIST] dumped\n"); }
+			}
 #ifdef N64_EMUX
-			if (f == BENCH_START) EMUX_START(0);
+			if (f == BENCH_START) {
+				/* sub-slots ran since boot: zero them (none is running
+				 * between frames) so they cover the same window as slot 0 */
+				extern unsigned int emux_fame_calls;
+				for (int k = 1; k < 10; k++) emux_clear(k);
+				emux_fame_calls = 0; { extern unsigned int emux_fame_instrs; emux_fame_instrs = 0; }
+				EMUX_START(0);
+			}
 			if (f == BENCH_END) {
 				EMUX_STOP(0);
-				static const char *nm[5] = { "all", "68k", "z80", "vdp", "snd" };
-				for (int k = 0; k < 5; k++)
+				static const char *nm[10] = { "all", "68k", "z80", "vdp", "snd",
+					"fame", "vdpw", "vdpr", "dma", "z80in68k" };
+				extern unsigned int emux_fame_calls;
+				{ extern unsigned int emux_fame_instrs;
+				debugf("[EMUX] fame calls/frame=%u instrs/frame=%u\n", emux_fame_calls / (BENCH_END - BENCH_START), emux_fame_instrs / (BENCH_END - BENCH_START)); }
+				for (int k = 0; k < 10; k++)
 					debugf("[EMUX] %-3s cyc/frame=%lu  I$miss/frame=%lu  D$miss/frame=%lu  D$wb/frame=%lu  I$hit/frame=%lu\n",
 						nm[k],
 						(unsigned long)(emux_profread(k, 0x0000) / (BENCH_END - BENCH_START)),

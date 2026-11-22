@@ -11,6 +11,13 @@
 #include "pico_int.h"
 #define NEED_DMA_SOURCE
 #include "memory.h"
+#ifdef N64
+#include "../platform/n64/emux.h"
+#endif
+#ifndef EMUX_START
+#define EMUX_START(s)
+#define EMUX_STOP(s)
+#endif
 
 
 enum { clkdiv = 2 };    // CPU clock granularity: one of 1,2,4,8
@@ -940,7 +947,9 @@ PICO_INTERNAL_ASM void PicoVideoWrite(u32 a,unsigned short d)
       // Check for dma:
       if (d & 0x80) {
         PicoVideoSync(InHblank(93));
+        EMUX_START(8);
         CommandDma();
+        EMUX_STOP(8);
       }
     }
     else

@@ -279,14 +279,20 @@ PICO_INTERNAL void PicoSyncZ80(unsigned int m68k_cycles_done)
     Pico.t.z80c_aim, Pico.t.z80c_aim * 15 / 7 / 488);
 
   if (cnt > 0) {
-#ifdef N64_BENCH
+#ifdef N64_BENCH_TIMERS
     extern unsigned int bench_z80_ticks, bench_z80_calls;
     unsigned int _bt = timer_ticks();
 #endif
     EMUX_START(2);
+#ifdef N64_EMUX
+    { extern int emux_in68k; if (emux_in68k) EMUX_START(9); }
+#endif
     Pico.t.z80c_cnt += z80_run(cnt);
+#ifdef N64_EMUX
+    { extern int emux_in68k; if (emux_in68k) EMUX_STOP(9); }
+#endif
     EMUX_STOP(2);
-#ifdef N64_BENCH
+#ifdef N64_BENCH_TIMERS
     bench_z80_ticks += timer_ticks() - _bt; bench_z80_calls++;
 #endif
   }
