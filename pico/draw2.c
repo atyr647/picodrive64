@@ -58,6 +58,26 @@ void DrawSpriteFull(unsigned int *sprite, struct PicoEState *est);
 
 
 #if defined(N64) && !INTERLACE
+/* Band rendering (N64): instead of sweeping each layer over the whole 84KB
+ * framebuffer (~6 passes through an 8KB D-cache, every line missed and
+ * written back each pass), run the complete layer sequence on one band of
+ * DRAW2_BAND lines at a time so the band stays cached.  Every draw is
+ * clipped to [clip_lo, clip_hi) (row pointers); per pixel, the writes and
+ * their order are exactly those of the full-frame passes.  0 disables. */
+#ifndef DRAW2_BAND
+#define DRAW2_BAND 16
+#endif
+#define BANDED (DRAW2_BAND > 0)
+static unsigned char *clip_lo = (unsigned char *)0;
+static unsigned char *clip_hi = (unsigned char *)~(uintptr_t)0;
+/* does the 8-line tile row starting at p intersect the clip band? */
+#define ROW_VIS(p, stride) ((p) + 8*(stride) > clip_lo && (p) < clip_hi)
+#else
+#define BANDED 0
+#define ROW_VIS(p, stride) 1
+#endif
+
+#if defined(N64) && !INTERLACE
 /* N64 (big-endian MIPS III, 64-bit registers): draw a whole 8-pixel tile row
  * with 64-bit SWAR instead of 8 test-and-store byte writes.  A VRAM tile row
  * is one 32-bit word, pixels p0..p7 from the top nibble down.  spread8()
@@ -109,9 +129,10 @@ static inline int TileRowsN64(unsigned char *pd, int addr, unsigned char pal,
 	for (i = 8; i; i--, addr += ystep, pd += stride) {
 		u32 w = *(const u32 *)(vram + addr);
 		if (!w) continue;
+		blank = 0;   /* judged on all 8 rows, clipped or not: callers cache it */
+		if (pd < clip_lo || pd >= clip_hi) continue;
 		if (xflip) w = nibrev32(w);
 		put8(pd, spread8(w), pal8);
-		blank = 0;
 	}
 	return blank;
 }
@@ -275,6 +296,7 @@ static void DrawWindowFull(int start, int end, int prio, struct PicoEState *est)
 
 	// do a window until we reach planestart row
 	for(trow = start; trow < end; trow++, nametab+=nametab_step) { // current tile row
+		if (!ROW_VIS(scrpos, est->Draw2Width)) { scrpos += est->Draw2Width*8; continue; }
 		for (tilex=tile_start; tilex<tile_end; tilex++)
 		{
 			int code,addr,zero=0;
@@ -382,6 +404,11 @@ static void DrawLayerFull(int plane, u32 *hcache, int planestart, int planeend,
 			int htaddr=htab+(trow<<4);
 			if(trow) htaddr-=(vscroll&7)<<1;
 			hscroll=est->PicoMem_vram[htaddr&0x7fff];
+		}
+
+		if (!ROW_VIS(scrpos+(8-(vscroll&7))*est->Draw2Width, est->Draw2Width)) {
+			scrpos += est->Draw2Width*8;
+			continue;
 		}
 
 		// Draw tiles across screen:
@@ -539,6 +566,11 @@ static void DrawSpriteFull(u32 *sprite, struct PicoEState *est)
 		int w = width, x=sx, t=tile, s;
 
 		if(sy >= END_ROW*8+8) return; // offscreen
+		if (!ROW_VIS(scrpos, est->Draw2Width)) {
+			if (scrpos >= clip_hi) return;
+			scrpos += 8*est->Draw2Width;
+			continue;
+		}
 
 		for (; w; w--,x+=8,t+=tdeltax)
 		{
@@ -566,12 +598,12 @@ static void DrawSpriteFull(u32 *sprite, struct PicoEState *est)
 #endif
 
 
-static void DrawAllSpritesFull(int prio, int maxwidth, struct PicoEState *est)
+/* select the visible sprites of one priority (in table order); returns count */
+static int CollectSpritesFull(int prio, int maxwidth, struct PicoEState *est, u32 **sprites)
 {
 	struct PicoVideo *pvid=&est->Pico->video;
 	int table=0,maskrange=0;
 	int i,u,link=0;
-	u32 *sprites[80]; // Sprites
 	int y_min=START_ROW*8, y_max=END_ROW*8; // for a simple sprite masking
 	int max_sprites = !(est->rendstatus & PDRAW_32_COLS) ? 80 : 64;
 
@@ -635,6 +667,13 @@ static void DrawAllSpritesFull(int prio, int maxwidth, struct PicoEState *est)
 		link=(code>>16)&0x7f;
 		if(!link) break; // End of sprites
 	}
+	return i;
+}
+
+static void DrawAllSpritesFull(int prio, int maxwidth, struct PicoEState *est)
+{
+	u32 *sprites[80]; // Sprites
+	int i = CollectSpritesFull(prio, maxwidth, est, sprites);
 
 	// Go through sprites backwards:
 	for (i--; i >= 0; i--)
@@ -644,7 +683,7 @@ static void DrawAllSpritesFull(int prio, int maxwidth, struct PicoEState *est)
 }
 
 #ifndef _ASM_DRAW_C
-static void BackFillFull(unsigned char *dst, int reg7, int lwidth)
+static void BackFillRows(unsigned char *dst, int reg7, int lwidth, int y0, int y1)
 {
 	unsigned int back;
 	int i;
@@ -659,7 +698,7 @@ static void BackFillFull(unsigned char *dst, int reg7, int lwidth)
 	 * contiguous block, left margins included (margins are never
 	 * displayed and tiles overdraw them anyway). */
 	{
-		unsigned char *p = dst + 8*lwidth, *end = p + (END_ROW-START_ROW)*8*lwidth;
+		unsigned char *p = dst + y0*lwidth, *end = dst + y1*lwidth;
 		if (((((uintptr_t)p) | ((uintptr_t)end)) & 15) == 0 &&
 		    ((uintptr_t)p >> 29) == 4) {   /* cached KSEG0 only */
 			unsigned long long b8 = (reg7 & 0x3f) * 0x0101010101010101ULL;
@@ -678,8 +717,13 @@ static void BackFillFull(unsigned char *dst, int reg7, int lwidth)
 	back|=back<<8;
 	back|=back<<16;
 
-	for (i = 0, dst += 8*lwidth; i < (END_ROW-START_ROW)*8; i++, dst += lwidth)
+	for (i = y0, dst += y0*lwidth; i < y1; i++, dst += lwidth)
 		memset32(dst+8, back, 320/4);
+}
+
+static void BackFillFull(unsigned char *dst, int reg7, int lwidth)
+{
+	BackFillRows(dst, reg7, lwidth, 8, 8 + (END_ROW-START_ROW)*8);
 }
 #endif
 
@@ -756,6 +800,18 @@ static void DrawDisplayFull(void)
 
 	if (hvwin==1) { winend|=maxcolc<<16; planeend|=maxcolc<<16; }
 
+#if BANDED
+	u32 *spr_lo[80], *spr_hi[80];
+	int n_lo = (pvid->debug_p & PVD_KILL_S_LO) ? 0 : CollectSpritesFull(0, maxw, est, spr_lo);
+	int n_hi = (pvid->debug_p & PVD_KILL_S_HI) ? 0 : CollectSpritesFull(1, maxw, est, spr_hi);
+	int band_y, fb_end = 8 + (END_ROW-START_ROW)*8;
+	for (band_y = 8; band_y < fb_end; band_y += DRAW2_BAND) {
+	int band_y1 = band_y + DRAW2_BAND < fb_end ? band_y + DRAW2_BAND : fb_end;
+	int si;
+	clip_lo = est->Draw2FB + band_y  * est->Draw2Width;
+	clip_hi = est->Draw2FB + band_y1 * est->Draw2Width;
+	BackFillRows(est->Draw2FB, pvid->reg[7], est->Draw2Width, band_y, band_y1);
+#endif
 	HighCache2A[0] = HighCache2B[0] = 0;
 	PROF2_START();
 	if (!(pvid->debug_p & PVD_KILL_B))
@@ -787,8 +843,13 @@ static void DrawDisplayFull(void)
 		break;
 	}
 	PROF2_LAY();
+#if BANDED
+	for (si = n_lo - 1; si >= 0; si--)
+		DrawSpriteFull(spr_lo[si], est);
+#else
 	if (!(pvid->debug_p & PVD_KILL_S_LO))
 		DrawAllSpritesFull(0, maxw, est);
+#endif
 	PROF2_SPR();
 
 	if (HighCache2B[0]) DrawTilesFromCacheF(HighCache2B, est);
@@ -813,9 +874,18 @@ static void DrawDisplayFull(void)
 		DrawWindowFull(winstart, winend, 1, est);
 		break;
 	}
+#if BANDED
+	for (si = n_hi - 1; si >= 0; si--)
+		DrawSpriteFull(spr_hi[si], est);
+	PROF2_SPR();
+	}  /* band loop */
+	clip_lo = (unsigned char *)0;
+	clip_hi = (unsigned char *)~(uintptr_t)0;
+#else
 	if (!(pvid->debug_p & PVD_KILL_S_HI))
 		DrawAllSpritesFull(1, maxw, est);
 	PROF2_SPR();
+#endif
 }
 
 
@@ -827,9 +897,16 @@ PICO_INTERNAL void PicoFrameFull(void)
 	if (PicoPrepareCram) PicoPrepareCram();
 
 	// Draw screen:
+#if BANDED
+	if (Pico.video.reg[1] & 0x40)
+		DrawDisplayFull();   /* fills the background band by band */
+	else
+		BackFillFull(Pico.est.Draw2FB, Pico.video.reg[7], Pico.est.Draw2Width);
+#else
 	BackFillFull(Pico.est.Draw2FB, Pico.video.reg[7], Pico.est.Draw2Width);
 	if (Pico.video.reg[1] & 0x40)
 		DrawDisplayFull();
+#endif
 
 	// clear top and bottom 8 lines in 240 mode, since draw2 only does 224
 	if (Pico.est.rendstatus & PDRAW_30_ROWS) {

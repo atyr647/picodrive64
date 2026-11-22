@@ -14,8 +14,29 @@ matches the base name with any suffix.
 """
 import bisect, subprocess, sys
 
-log, elf, out = sys.argv[1], sys.argv[2], sys.argv[3]
-min_samples = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+group_mode = "--group" in sys.argv
+log, elf, out = args[0], args[1], args[2]
+min_samples = int(args[3]) if len(args) > 3 else 2
+
+# --group: order by subsystem first (68k, z80, vdp, sound, other), hottest
+# first within each, so each component's hot code is contiguous instead of
+# interleaved with the others' (they run in separate phases of a frame).
+GROUPS = [
+    ("68k", ("OP_0x", "fm68k", "m68k_", "PicoRead", "PicoWrite", "PicoVideo",
+             "CommandDma", "DmaSlow", "SekInterrupt", "io_ports", "port_read",
+             "ctl_write", "vdp_")),
+    ("z80", ("Cz80", "z80_", "ym2612_read_local_z80", "ym2612_write_local",
+             "PsndDoDAC", "PsndDoPSG", "SN76496", "ym2612_sync")),
+    ("vdp", ("Draw", "PicoFrameFull", "BackFill", "Tile", "PicoDraw")),
+    ("snd", ("YM2612", "update_eg", "Psnd", "rsp_fm", "mix_", "write_sound",
+             "refresh_fc", "OPN", "chan_")),
+]
+def group_of(base):
+    for i, (_, prefixes) in enumerate(GROUPS):
+        if base.startswith(prefixes):
+            return i
+    return len(GROUPS)
 nm = "/opt/libdragon/bin/mips64-elf-nm"
 
 syms = []
@@ -37,9 +58,12 @@ for line in open(log, errors="replace"):
             per[syms[i][2]] = per.get(syms[i][2], 0) + int(c)
 
 bases, seen, total, kept = [], set(), sum(per.values()), 0
-for name, c in sorted(per.items(), key=lambda x: -x[1]):
+order = sorted(per.items(), key=lambda x: -x[1])
+if group_mode:
+    order.sort(key=lambda x: group_of(x[0].split(".")[0]))  # stable: hotness kept within group
+for name, c in order:
     if c < min_samples:
-        break
+        continue
     base = name.split(".")[0]
     if base and base not in seen:
         seen.add(base)
