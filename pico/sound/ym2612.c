@@ -1945,17 +1945,23 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 				if (!(ym2612.slot_mask & (0xf << (ch*4))))
 					continue;
 				ssg_en = ((ym2612.ssg_mask >> (ch*4)) & 0xf) && (ym2612.OPN.ST.flags & ST_SSG);
+				/* Per tick: if (cnt) cnt--; if (!cnt) { cnt = 3; EG update }.
+				 * So the first update comes after max(cnt,1) ticks and then
+				 * every 3rd: count them instead of stepping every tick. */
 				cnt = fch->upd_cnt & 3;
-				for (t = ticks; t; t--) {
-					if (cnt) cnt--;
-					if (!cnt) {
-						cnt = 3;
+				t = cnt ? cnt : 1;
+				if (ticks < t)
+					cnt -= ticks;
+				else {
+					UINT32 upd = 1 + (ticks - t) / 3;
+					cnt = 3 - (ticks - t) % 3;
+					do {
 						if (++egc >= 4096) egc = 1;
 						if (fch->SLOT[SLOT1].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT1], egc, ssg_en);
 						if (fch->SLOT[SLOT2].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT2], egc, ssg_en);
 						if (fch->SLOT[SLOT3].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT3], egc, ssg_en);
 						if (fch->SLOT[SLOT4].state != EG_OFF) update_eg_phase(&fch->SLOT[SLOT4], egc, ssg_en);
-					}
+					} while (--upd);
 				}
 				fch->upd_cnt = cnt;
 				eg_end = egc;
