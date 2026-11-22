@@ -85,7 +85,12 @@ static short __attribute__((aligned(8))) snd_buffer[SND_RATE / 50 + 16];
 #define DEV_BENCH     1   /* scripted input, [BENCH] timing + state hashes */
 #define DEV_TRACE     2   /* ares (patched): I/D trace of a frame window */
 #define DEV_MISSHIST  4   /* ares (patched): cache-miss histograms */
-static struct { uint32_t flags, trace_start, trace_frames, reserved; } devcfg;
+static struct {
+	uint32_t flags, trace_start, trace_frames;
+	uint32_t input;			/* benchmark input: 0 Gley Lancer script, 1 none */
+	uint32_t bench_start, bench_end;	/* measured window (0: defaults) */
+	uint32_t reserved[2];
+} devcfg;
 extern uint32_t rompak_search_ext(const char *ext, size_t *size);
 static void devcfg_load(void)
 {
@@ -96,6 +101,11 @@ static void devcfg_load(void)
 	devcfg.flags = io_read(a);
 	devcfg.trace_start = io_read(a + 4);
 	devcfg.trace_frames = io_read(a + 8);
+	if (sz >= 24) {
+		devcfg.input = io_read(a + 12);
+		devcfg.bench_start = io_read(a + 16);
+		devcfg.bench_end = io_read(a + 20);
+	}
 }
 static inline void dev_xprof(unsigned int code)
 {
@@ -202,9 +212,13 @@ uint32_t bench_audio_hash = 2166136261u; unsigned int bench_audio_n;
 uint32_t bench_fb_hash = 2166136261u; unsigned int bench_fb_n;
 unsigned int bench_z80_ticks, bench_z80_calls, bench_fmwait_ticks, bench_blitwait_ticks, bench_fmwait_skip;
 
+static unsigned int bench_start = BENCH_START, bench_end = BENCH_END;
+
 static unsigned int bench_pad(unsigned int f)
 {
 	unsigned int pad = 0;
+	if (devcfg.input == 1)		/* no input: e.g. measure an attract-mode demo */
+		return 0;
 	if (f < BENCH_PLAY) {
 		/* tap Start (and C/A to confirm menus) for 6 frames every 40 */
 		if (f >= 120 && (f % 40) < 6)
@@ -398,8 +412,15 @@ int main(int argc, char *argv[])
 	debug_init_isviewer();
 	devcfg_load();
 	if (devcfg.flags)
-		debugf("[DEVCFG] flags=%lx trace=%lu+%lu\n", (unsigned long)devcfg.flags,
-		       (unsigned long)devcfg.trace_start, (unsigned long)devcfg.trace_frames);
+		debugf("[DEVCFG] flags=%lx trace=%lu+%lu input=%lu bench=%lu-%lu\n", (unsigned long)devcfg.flags,
+		       (unsigned long)devcfg.trace_start, (unsigned long)devcfg.trace_frames,
+		       (unsigned long)devcfg.input, (unsigned long)devcfg.bench_start, (unsigned long)devcfg.bench_end);
+#ifdef N64_BENCH
+	if (devcfg.bench_start && devcfg.bench_end > devcfg.bench_start) {
+		bench_start = devcfg.bench_start;
+		bench_end = devcfg.bench_end;
+	}
+#endif
 	display_init(RESOLUTION_320x240, DEPTH_16_BPP, 3, GAMMA_NONE, FILTERS_RESAMPLE);
 	rdpq_init();
 	audio_init(SND_RATE, 4);
@@ -885,7 +906,7 @@ post_render: ;
 			PicoIn.pad[0] = bench_pad(f);
 			if ((f % 60) == 0)
 				debugf("[BF] f=%u\n", f);
-			if (f > BENCH_START && f <= BENCH_END) {
+			if (f > bench_start && f <= bench_end) {
 				b_ticks += tnow - b_last;
 				b_68k += prof_68k_ticks;
 				b_vdp += prof_vdp_ticks;
@@ -893,7 +914,7 @@ post_render: ;
 			}
 			b_last = tnow;
 #ifdef N64_PROF_SAMPLE
-			if (f == BENCH_START)
+			if (f == bench_start)
 				ps_start();
 #endif
 			if (devcfg.flags & DEV_TRACE) {
@@ -905,7 +926,7 @@ post_render: ;
 				if (f == devcfg.trace_start + devcfg.trace_frames) { dev_xprof(7); debugf("[MISSHIST] dumped\n"); }
 			}
 #ifdef N64_EMUX
-			if (f == BENCH_START) {
+			if (f == bench_start) {
 				/* sub-slots ran since boot: zero them (none is running
 				 * between frames) so they cover the same window as slot 0 */
 				extern unsigned int emux_fame_calls;
@@ -913,37 +934,37 @@ post_render: ;
 				emux_fame_calls = 0; { extern unsigned int emux_fame_instrs; emux_fame_instrs = 0; }
 				EMUX_START(0);
 			}
-			if (f == BENCH_END) {
+			if (f == bench_end) {
 				EMUX_STOP(0);
 				static const char *nm[10] = { "all", "68k", "z80", "vdp", "snd",
 					"fame", "vdpw", "vdpr", "dma", "z80in68k" };
 				extern unsigned int emux_fame_calls;
 				{ extern unsigned int emux_fame_instrs;
-				debugf("[EMUX] fame calls/frame=%u instrs/frame=%u\n", emux_fame_calls / (BENCH_END - BENCH_START), emux_fame_instrs / (BENCH_END - BENCH_START)); }
+				debugf("[EMUX] fame calls/frame=%u instrs/frame=%u\n", emux_fame_calls / (bench_end - bench_start), emux_fame_instrs / (bench_end - bench_start)); }
 				for (int k = 0; k < 10; k++)
 					debugf("[EMUX] %-3s cyc/frame=%lu  I$miss/frame=%lu  D$miss/frame=%lu  D$wb/frame=%lu  I$hit/frame=%lu\n",
 						nm[k],
-						(unsigned long)(emux_profread(k, 0x0000) / (BENCH_END - BENCH_START)),
-						(unsigned long)(emux_profread(k, 0x0011) / (BENCH_END - BENCH_START)),
-						(unsigned long)(emux_profread(k, 0x0021) / (BENCH_END - BENCH_START)),
-						(unsigned long)(emux_profread(k, 0x0022) / (BENCH_END - BENCH_START)),
-						(unsigned long)(emux_profread(k, 0x0010) / (BENCH_END - BENCH_START)));
+						(unsigned long)(emux_profread(k, 0x0000) / (bench_end - bench_start)),
+						(unsigned long)(emux_profread(k, 0x0011) / (bench_end - bench_start)),
+						(unsigned long)(emux_profread(k, 0x0021) / (bench_end - bench_start)),
+						(unsigned long)(emux_profread(k, 0x0022) / (bench_end - bench_start)),
+						(unsigned long)(emux_profread(k, 0x0010) / (bench_end - bench_start)));
 			}
 #endif
-			if (f == BENCH_START) {
+			if (f == bench_start) {
 				z0t = bench_z80_ticks; z0c = bench_z80_calls;
 				fw0 = bench_fmwait_ticks; bw0 = bench_blitwait_ticks; fs0 = bench_fmwait_skip;
 			}
 #ifdef Z80_PCHIST
-			if (f == BENCH_START)
+			if (f == bench_start)
 				memset(z80_pchist, 0, sizeof(z80_pchist));
 #endif
 #ifdef FAME_PCHIST
-			if (f == BENCH_START)
+			if (f == bench_start)
 				memset(m68k_pchist, 0, sizeof(m68k_pchist));
 #endif
 #ifdef BENCH_EG_TRACE
-			if (f >= BENCH_START && f <= BENCH_END) {
+			if (f >= bench_start && f <= bench_end) {
 				uint32_t eh = 2166136261u;
 				for (int c = 0; c < 6; c++) {
 					for (int k = 0; k < 4; k++) {
@@ -959,10 +980,10 @@ post_render: ;
 				debugf("[EG] %u %08lx ssg=%08lx fl=%x slots=%06lx\n", f, (unsigned long)eh, (unsigned long)ym2612.ssg_mask, ym2612.OPN.ST.flags, (unsigned long)ym2612.slot_mask);
 			}
 #endif
-			if (f == BENCH_END || f == BENCH_END + 1)
+			if (f == bench_end || f == bench_end + 1)
 				debugf("[AUDIO] f=%u samples=%u hash=%08lx fbframes=%u fbhash=%08lx\n", f, bench_audio_n,
 				       (unsigned long)bench_audio_hash, bench_fb_n, (unsigned long)bench_fb_hash);
-			if (f == BENCH_END) {
+			if (f == bench_end) {
 #ifdef N64_PROF_SAMPLE
 				ps_stop_and_dump();
 #endif
