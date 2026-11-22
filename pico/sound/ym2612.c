@@ -1830,16 +1830,37 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 	refresh_fc_eg_chan( &ym2612.CH[5] );
 
 #ifdef N64
-	/* RSP FM synthesis: offload operator math to RSP */
+	/* RSP FM synthesis, pipelined by one frame.
+	 *
+	 * Frame N's job is submitted here and NOT waited for: this call returns
+	 * frame N-1's FM output instead (finished long ago), and sound.c delays
+	 * DAC/PSG by one frame to match, so the mix stays aligned and only the
+	 * overall latency grows by one frame (~17 ms).  The CPU used to stall
+	 * ~1.5 ms/frame here waiting for the RSP.
+	 *
+	 * What makes it possible: nothing comes back from the RSP except
+	 * samples.  Operator phases advance by exactly incr per sample (32-bit
+	 * wrap) on the RSP, so the CPU applies phase += incr*length itself; the
+	 * only other per-channel history (op1_out feedback, algorithm mem) lives
+	 * in the overlay's persistent state (rsp_fm.S) and flows from one job to
+	 * the next on the RSP. */
 	if (length > 0 && length <= 256) {
-		extern void rsp_fm_render(struct rsp_fm_state *, int32_t *);
-		static struct rsp_fm_state __attribute__((aligned(16))) rsp_state;
-		static int32_t __attribute__((aligned(16))) rsp_out[256];
-		int c;
+		extern void rsp_fm_render(struct rsp_fm_state *, int32_t *, int);
+		extern int ym2612_rsp_reset;
+		/* Each slot must start 8-byte aligned for RSP DMA (sizeof(struct
+		 * rsp_fm_state) is 340, so a plain [2] array would put slot 1 at
+		 * +340 and the RSP would read every field 4 bytes off). */
+		static struct { struct rsp_fm_state s; } __attribute__((aligned(16))) rsp_slot[2];
+		static int32_t __attribute__((aligned(16))) rsp_out[2][256];
+		static rspq_syncpoint_t fm_sync[2];
+		static int fm_len[2];
+		static int cur, have_prev;
+		struct rsp_fm_state *st = &rsp_slot[cur].s;
+		int c, prev = cur ^ 1;
 
 		/* Extract channel state for RSP */
 		for (c = 0; c < 6; c++) {
-			struct rsp_fm_chan *rch = &rsp_state.ch[c];
+			struct rsp_fm_chan *rch = &st->ch[c];
 			FM_CH *fmch = &ym2612.CH[c];
 
 			if (!(ym2612.slot_mask & (0xf << (c*4)))) {
@@ -1863,8 +1884,6 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 
 			rch->fb_shift = fmch->FB;
 			rch->enabled = 1;
-			rch->op1_out = fmch->op1_out;
-			rch->mem = fmch->mem_value;
 
 			/* Algorithm routing params (replaces DMEM algo_table) */
 			{
@@ -1886,23 +1905,27 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 				rch->out_flags = algo_lut[algo][3];
 				rch->mem_src   = algo_lut[algo][4];
 			}
+
+			/* Advance phases exactly as the RSP will (per-sample 32-bit add) */
+			fmch->SLOT[SLOT1].phase += (UINT32)fmch->SLOT[SLOT1].Incr * (UINT32)length;
+			fmch->SLOT[SLOT2].phase += (UINT32)fmch->SLOT[SLOT2].Incr * (UINT32)length;
+			fmch->SLOT[SLOT3].phase += (UINT32)fmch->SLOT[SLOT3].Incr * (UINT32)length;
+			fmch->SLOT[SLOT4].phase += (UINT32)fmch->SLOT[SLOT4].Incr * (UINT32)length;
 		}
-		rsp_state.num_samples = length;
+		st->num_samples = length;
 
-		/* Submit RSP FM (non-blocking) */
-		rsp_fm_render(&rsp_state, rsp_out);
-		rspq_syncpoint_t fm_sync = rspq_syncpoint_new();
+		/* Submit RSP FM (non-blocking, never waited for this frame) */
+		rsp_fm_render(st, rsp_out[cur], ym2612_rsp_reset);
+		ym2612_rsp_reset = 0;
+		fm_sync[cur] = rspq_syncpoint_new();
+		fm_len[cur] = length;
 
-		/* Advance envelopes + LFO while RSP computes operators.
-		 * These don't depend on RSP output - only CPU-side state.
+		/* Advance envelopes + LFO (CPU-side state only).
 		 *
 		 * Batched: the original per-sample outer loop only updates
 		 * the timer; inner work depends solely on tick count. So we
 		 * collapse the outer loop to one math op and run the inner
-		 * loop `ticks` times. Semantically identical, saves ~length
-		 * iterations of add+compare+branch per batch. This shape
-		 * also maps cleanly to RSP (no scalar mul on RSP: the CPU
-		 * hands ticks over directly when this moves to the RSP). */
+		 * loop `ticks` times. Semantically identical. */
 		{
 			uint64_t total = (uint64_t)ym2612.OPN.eg_timer
 				+ (uint64_t)ym2612.OPN.eg_timer_add * (uint32_t)length;
@@ -1937,29 +1960,25 @@ int YM2612UpdateOne_(s32 *buffer, int length, int stereo, int is_buf_empty)
 		}
 		ym2612.OPN.lfo_cnt += ym2612.OPN.lfo_inc * length;
 
-		/* Wait for RSP FM command specifically (not entire queue) */
-		rspq_syncpoint_wait(fm_sync);
-		data_cache_hit_invalidate(&rsp_state, (sizeof(rsp_state) + 15) & ~15);
-		data_cache_hit_invalidate(rsp_out, (length * sizeof(int32_t) + 15) & ~15);
-
-		/* Copy RSP output to FM buffer */
-		for (c = 0; c < length; c++)
-			buffer[c] += rsp_out[c];
-
-		/* Write back RSP-maintained state */
-		for (c = 0; c < 6; c++) {
-			FM_CH *fmch = &ym2612.CH[c];
-			if (!(ym2612.slot_mask & (0xf << (c*4)))) continue;
-
-			fmch->op1_out = rsp_state.ch[c].op1_out;
-			fmch->mem_value = rsp_state.ch[c].mem;
-
-			fmch->SLOT[SLOT1].phase = rsp_state.ch[c].phase[0];
-			fmch->SLOT[SLOT2].phase = rsp_state.ch[c].phase[1];
-			fmch->SLOT[SLOT3].phase = rsp_state.ch[c].phase[2];
-			fmch->SLOT[SLOT4].phase = rsp_state.ch[c].phase[3];
+		/* Mix in the PREVIOUS frame's FM output (normally complete by now) */
+		if (have_prev) {
+			int n = fm_len[prev];
+#ifdef N64_BENCH
+			{ extern unsigned int bench_fmwait_ticks; unsigned int _bt = timer_ticks();
+			rspq_syncpoint_wait(fm_sync[prev]);
+			bench_fmwait_ticks += timer_ticks() - _bt;
+			{ extern unsigned int bench_fmwait_skip; if (PicoIn.skipFrame) bench_fmwait_skip += timer_ticks() - _bt; } }
+#else
+			rspq_syncpoint_wait(fm_sync[prev]);
+#endif
+			data_cache_hit_invalidate(rsp_out[prev], (n * sizeof(int32_t) + 15) & ~15);
+			if (is_buf_empty && n > length)
+				memset32(buffer + length, 0, n - length);
+			for (c = 0; c < n; c++)
+				buffer[c] += rsp_out[prev][c];
 		}
-
+		have_prev = 1;
+		cur = prev;
 		return 1;
 	}
 #else
@@ -2008,9 +2027,15 @@ void YM2612Init_(int clock, int rate, int flags)
 
 
 /* reset */
+#ifdef N64
+int ym2612_rsp_reset = 1;  /* tell the RSP FM overlay to clear its persistent state */
+#endif
 void YM2612ResetChip_(void)
 {
 	int i;
+#ifdef N64
+	ym2612_rsp_reset = 1;
+#endif
 
 	memset(ym2612.REGS, 0, sizeof(ym2612.REGS));
 

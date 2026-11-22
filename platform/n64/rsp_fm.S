@@ -11,6 +11,12 @@
     .align 3
 sin_tab:    .space 512       /* 256 x uint16_t */
 exp_tab:    .space 512       /* 256 x uint16_t */
+    /* Per-channel FM history that must survive between commands:
+     * {op1_out, mem} x 6.  Kept here (overlay saved state, preserved by
+     * rspq across overlay switches) instead of round-tripping through the
+     * CPU, so the CPU never has to wait for a render to finish before
+     * building the next one: it advances the phases itself. */
+persist:    .space 48
     RSPQ_EndSavedState
 
     .bss
@@ -44,7 +50,8 @@ cmd_fm_init_tables:
     ##############################################
     # cmd_fm_render
     #
-    # a0[23:0]  = num_samples
+    # a0[15:0]  = num_samples
+    # a0[16]    = reset persistent op1_out/mem state (YM2612 reset)
     # a1        = PhysicalAddr(state)  [344 bytes]
     # a2        = PhysicalAddr(out_buf)
     #
@@ -75,6 +82,32 @@ cmd_fm_render:
     li      t0, DMA_SIZE(344, 1)
     jal     DMAIn
     nop
+
+    /* Optional reset of the persistent state (a0 bit 16) */
+    srl     t0, a0, 16
+    andi    t0, t0, 1
+    beqz    t0, persist_load
+    li      t3, %lo(persist)
+    li      t5, %lo(persist+48)
+persist_clear:
+    sw      zero, 0(t3)
+    addiu   t3, t3, 4
+    bne     t3, t5, persist_clear
+    nop
+
+    /* Load op1_out/mem for all 6 channels from the persistent state */
+persist_load:
+    li      t3, %lo(persist)
+    li      v1, %lo(chan_state)
+    li      t5, %lo(persist+48)
+persist_load_loop:
+    lw      t0, 0(t3)
+    lw      t1, 4(t3)
+    sw      t0, 44(v1)
+    sw      t1, 48(v1)
+    addiu   t3, t3, 8
+    bne     t3, t5, persist_load_loop
+    addiu   v1, v1, 56
 
     /* Clear output buffer */
     li      t3, %lo(work_out)
@@ -395,12 +428,19 @@ chan_next:
     bnez    fp, chan_loop
     nop
 
-    /* ---- DMA state back to RDRAM ---- */
-    lw      s0, %lo(rdram_state)
-    li      s4, %lo(chan_state)
-    li      t0, DMA_SIZE(344, 1)
-    jal     DMAOut
-    nop
+    /* ---- Save op1_out/mem back to the persistent state ----
+     * (No state DMA back to RDRAM: the CPU advances phases itself.) */
+    li      t3, %lo(persist)
+    li      v1, %lo(chan_state)
+    li      t5, %lo(persist+48)
+persist_save_loop:
+    lw      t0, 44(v1)
+    lw      t1, 48(v1)
+    sw      t0, 0(t3)
+    sw      t1, 4(t3)
+    addiu   t3, t3, 8
+    bne     t3, t5, persist_save_loop
+    addiu   v1, v1, 56
 
     /* ---- DMA output to RDRAM ---- */
     lw      s0, %lo(rdram_out)

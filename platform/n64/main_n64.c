@@ -103,8 +103,149 @@ static void write_sound(int len)
 	/* In-flight = total - free (for reporting). */
 	snd_latest_fill = (unsigned)(AUDIO_NUM_BUFFERS - free_bufs);
 	snd_total_samples += nsamples;
+#ifdef N64_BENCH
+	{
+		extern uint32_t bench_audio_hash; extern unsigned int bench_audio_n;
+		const uint8_t *b = (const uint8_t *)snd_buffer;
+		for (int i = 0; i < nsamples * 2; i++)
+			bench_audio_hash = (bench_audio_hash ^ b[i]) * 16777619u;
+		bench_audio_n += nsamples;
+#ifdef BENCH_AUDIO_TRACE
+		{ uint32_t fh = 2166136261u;
+		  for (int i = 0; i < nsamples * 2; i++) fh = (fh ^ b[i]) * 16777619u;
+		  debugf("[AH] %u %u %08lx\n", Pico.m.frame_count, nsamples, (unsigned long)fh); }
+#endif
+	}
+#endif
+#ifdef N64_BENCH
+	/* Never wait on the audio DAC in benchmark mode: measure raw
+	 * throughput even when emulation runs faster than real time. */
+	if (free_bufs > 0)
+		audio_push(snd_stereo, nsamples, false);
+#else
 	audio_push(snd_stereo, nsamples, true);
+#endif
 }
+
+#ifdef N64_BENCH
+/* ---- Deterministic benchmark mode (make ... EXTRA_CFLAGS=-DN64_BENCH) ----
+ *
+ * Input is scripted from the EMULATED frame number, so every build sees
+ * the same game frames, and the cost of the window [BENCH_START,BENCH_END)
+ * is directly comparable between builds.  At BENCH_END it prints the N64
+ * time per emulated frame (whole main loop: emulation + blit + audio +
+ * input) and a hash of 68k RAM + VRAM: identical hashes mean an
+ * optimisation did not change emulation results.  Run it headless with
+ * platform/n64/tools/ares_profile.sh. */
+#ifndef BENCH_PLAY
+#define BENCH_PLAY   500    /* last Start tap at f480; gameplay begins ~f560 */
+#endif
+#ifndef BENCH_START
+#define BENCH_START  900
+#endif
+#ifndef BENCH_END
+#define BENCH_END    3300
+#endif
+
+uint32_t bench_audio_hash = 2166136261u; unsigned int bench_audio_n;
+unsigned int bench_z80_ticks, bench_z80_calls, bench_fmwait_ticks, bench_blitwait_ticks, bench_fmwait_skip;
+
+static unsigned int bench_pad(unsigned int f)
+{
+	unsigned int pad = 0;
+	if (f < BENCH_PLAY) {
+		/* tap Start (and C/A to confirm menus) for 6 frames every 40 */
+		if (f >= 120 && (f % 40) < 6)
+			pad = (1 << GBTN_START) | (((f / 40) & 1) ? (1 << GBTN_C) : 0);
+	} else {
+		/* "play": autofire B, weave up/down, drift left/right */
+		if ((f & 7) < 4) pad |= 1 << GBTN_B;
+		if ((f % 240) < 90)        pad |= 1 << GBTN_UP;
+		else if ((f % 240) >= 120 && (f % 240) < 210) pad |= 1 << GBTN_DOWN;
+		if ((f % 600) < 150)       pad |= 1 << GBTN_RIGHT;
+		else if ((f % 600) >= 300 && (f % 600) < 450) pad |= 1 << GBTN_LEFT;
+	}
+	return pad;
+}
+
+#ifdef Z80_PCHIST
+unsigned int z80_pchist[0x2000];
+static void z80_pchist_dump(void)
+{
+	unsigned int tot = 0;
+	for (int i = 0; i < 0x2000; i++) tot += z80_pchist[i];
+	debugf("[ZHBEGIN] total=%u\n", tot);
+	for (int i = 0; i < 0x2000; i++)
+		if (z80_pchist[i]) debugf("[ZH] %04x %u\n", i, z80_pchist[i]);
+	debugf("[ZHEND]\n");
+	for (int i = 0; i < 0x2000; i += 32) {
+		char ln[80]; int n = 0;
+		for (int j = 0; j < 32; j++) n += sprintf(ln + n, "%02x", PicoMem.zram[i + j]);
+		debugf("[ZRAM] %04x %s\n", i, ln);
+	}
+}
+#endif
+
+#ifdef N64_PROF_SAMPLE
+/* Statistical PC sampler: a continuous timer interrupt reads the PC the
+ * main code was interrupted at (EPC, saved by libdragon's inthandler.S in
+ * the frame interrupt_exception_frame points to) and bumps a 16-byte
+ * bucket.  Dumped at BENCH_END as "[PS] addr count" lines; symbolize on
+ * the host with platform/n64/tools/prof_report.sh. */
+#include <timer.h>
+extern char __text_start[], __text_end[];
+extern void *interrupt_exception_frame;
+#define PS_SHIFT 4
+#define PS_EPC_OFF (32 + 32*8 + 8 + 8 + 4 + 4)   /* STACK_EPC in inthandler.S */
+static uint32_t *ps_hist;
+static unsigned int ps_nbuckets, ps_total, ps_outside;
+static timer_link_t *ps_timer;
+
+static void ps_tick(int ovfl)
+{
+	(void)ovfl;
+	uint32_t epc = *(uint32_t *)((char *)interrupt_exception_frame + PS_EPC_OFF);
+	uint32_t off = epc - (uint32_t)__text_start;
+	ps_total++;
+	if (off < (uint32_t)(__text_end - __text_start))
+		ps_hist[off >> PS_SHIFT]++;
+	else
+		ps_outside++;
+}
+
+static void ps_start(void)
+{
+	ps_nbuckets = ((__text_end - __text_start) >> PS_SHIFT) + 1;
+	ps_hist = calloc(ps_nbuckets, sizeof(uint32_t));
+	timer_init();   /* refcounted: safe if already initialised */
+	if (ps_hist)
+		ps_timer = new_timer(TIMER_TICKS(213), TF_CONTINUOUS, ps_tick); /* ~4.7kHz */
+}
+
+static void ps_stop_and_dump(void)
+{
+	if (!ps_timer) return;
+	delete_timer(ps_timer);
+	ps_timer = NULL;
+	debugf("[PSBEGIN] total=%u outside=%u text=%08lx shift=%d\n", ps_total, ps_outside,
+	       (unsigned long)(uint32_t)__text_start, PS_SHIFT);
+	for (unsigned int i = 0; i < ps_nbuckets; i++)
+		if (ps_hist[i])
+			debugf("[PS] %08lx %lu\n",
+			       (unsigned long)((uint32_t)__text_start + (i << PS_SHIFT)),
+			       (unsigned long)ps_hist[i]);
+	debugf("[PSEND]\n");
+}
+#endif
+
+static uint32_t bench_hash(const void *p, unsigned int len, uint32_t h)
+{
+	const uint8_t *b = p;
+	for (unsigned int i = 0; i < len; i++)
+		h = (h ^ b[i]) * 16777619u;
+	return h;
+}
+#endif
 
 /* Frame skip: 0=none, 1=skip 1, 2=skip 2 */
 static int frame_count = 0;
@@ -527,7 +668,12 @@ int main(int argc, char *argv[])
 
 			/* Finish previous RDP blit (ran during skip frame) */
 			if (pending_fb) {
+#ifdef N64_BENCH
+				{ unsigned int _bt = timer_ticks(); rspq_wait();
+				  bench_blitwait_ticks += timer_ticks() - _bt; }
+#else
 				rspq_wait();
+#endif
 				data_cache_hit_invalidate(pending_fb->buffer, 320 * 240 * 2);
 				graphics_set_color(
 					graphics_make_color(0xFF,0xFF,0xFF,0xFF),
@@ -615,6 +761,68 @@ post_render: ;
 		if (btns.c_right) pad |= 1 << GBTN_Y;
 
 		PicoIn.pad[0] = pad;
+
+#ifdef N64_BENCH
+		{
+			static unsigned int b_last, b_frames;
+			static uint64_t b_ticks, b_68k, b_vdp;
+			static unsigned int z0t, z0c, fw0, bw0, fs0;
+			unsigned int f = Pico.m.frame_count;
+			unsigned int tnow = timer_ticks();
+
+			PicoIn.pad[0] = bench_pad(f);
+			if ((f % 60) == 0)
+				debugf("[BF] f=%u\n", f);
+			if (f > BENCH_START && f <= BENCH_END) {
+				b_ticks += tnow - b_last;
+				b_68k += prof_68k_ticks;
+				b_vdp += prof_vdp_ticks;
+				b_frames++;
+			}
+			b_last = tnow;
+#ifdef N64_PROF_SAMPLE
+			if (f == BENCH_START)
+				ps_start();
+#endif
+			if (f == BENCH_START) {
+				z0t = bench_z80_ticks; z0c = bench_z80_calls;
+				fw0 = bench_fmwait_ticks; bw0 = bench_blitwait_ticks; fs0 = bench_fmwait_skip;
+			}
+#ifdef Z80_PCHIST
+			if (f == BENCH_START)
+				memset(z80_pchist, 0, sizeof(z80_pchist));
+#endif
+			if (f == BENCH_END || f == BENCH_END + 1)
+				debugf("[AUDIO] f=%u samples=%u hash=%08lx\n", f, bench_audio_n,
+				       (unsigned long)bench_audio_hash);
+			if (f == BENCH_END) {
+#ifdef N64_PROF_SAMPLE
+				ps_stop_and_dump();
+#endif
+#ifdef Z80_PCHIST
+				z80_pchist_dump();
+#endif
+				uint32_t h = bench_hash(PicoMem.ram, 0x10000, 2166136261u);
+				h = bench_hash(PicoMem.vram, 0x10000, h);
+				unsigned int us = (unsigned int)(TIMER_MICROS_LL(b_ticks) / b_frames);
+				debugf("[BENCH] frames=%u us/frame=%u (%u.%u%% speed) "
+				       "68k=%u vdp=%u other=%u us/frame  ramhash=%08lx\n",
+					b_frames, us,
+					(16666670u / us) / 10,
+					(16666670u / us) % 10,
+					(unsigned int)(TIMER_MICROS_LL(b_68k) / b_frames),
+					(unsigned int)(TIMER_MICROS_LL(b_vdp) / b_frames),
+					us - (unsigned int)(TIMER_MICROS_LL(b_68k + b_vdp) / b_frames),
+					(unsigned long)h);
+				debugf("[BENCH2] z80=%u us/frame (%u calls/frame) fmwait=%u (on skip frames %u) blitwait=%u us/frame\n",
+					(unsigned int)(TIMER_MICROS_LL(bench_z80_ticks - z0t) / b_frames),
+					(bench_z80_calls - z0c) / b_frames,
+					(unsigned int)(TIMER_MICROS_LL(bench_fmwait_ticks - fw0) / b_frames),
+					(unsigned int)(TIMER_MICROS_LL(bench_fmwait_skip - fs0) / b_frames),
+					(unsigned int)(TIMER_MICROS_LL(bench_blitwait_ticks - bw0) / b_frames));
+			}
+		}
+#endif
 	}
 }
 

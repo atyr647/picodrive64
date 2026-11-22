@@ -544,7 +544,7 @@ platform/n64/rsp_%_ovl.o: platform/n64/rsp_%.S
 	BINARY="$(basename $@).elf"; \
 	TEXTSYM=$$(echo "$(basename $@)_text" | tr '/.+-' '____'); \
 	DATASYM=$$(echo "$(basename $@)_data" | tr '/.+-' '____'); \
-	$(CC) -march=mips1 -mabi=32 -Wa,--fatal-warnings \
+	$(CC) -march=mips1 -mabi=32 -Wa,--fatal-warnings $(RSP_EXTRA) \
 		-I$(N64_INST)/mips64-elf/include \
 		-nostartfiles -Wl,-T$(N64_INST)/mips64-elf/lib/rsp.ld \
 		-Wl,--gc-sections -o $$BINARY $<; \

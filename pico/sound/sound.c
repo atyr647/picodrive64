@@ -515,6 +515,26 @@ static int PsndRender(int offset, int length)
     Pico.snd.dac_val2 = Pico.snd.dac_val;
   }
 
+#ifdef N64
+  // ym2612.c pipelines the RSP FM render by one frame (the FM update below
+  // returns the PREVIOUS frame's FM).  Delay this frame's DAC/PSG by one
+  // frame too, so everything stays aligned: output = DAC/PSG(N-1)+FM(N-1).
+  // Mono only (the N64 port runs mono).
+  if (PicoIn.sndOut && !stereo && (PicoIn.opt & POPT_EN_FM)) {
+    static s16 held[2*(54000+100)/50+2], tmp[2*(54000+100)/50+2];
+    static int held_len;
+    int out_len = held_len;
+    memcpy(tmp, PicoIn.sndOut, length * sizeof(s16));
+    memcpy(PicoIn.sndOut, held, out_len * sizeof(s16));
+    memcpy(held, tmp, length * sizeof(s16));
+    held_len = length;
+    if (length-fmlen > 0) {
+      Pico.snd.fm_pos += (length-fmlen) << 20;
+      PsndFMUpdate(buf32, length, 0, 1);   // adds FM(N-1): out_len samples
+    }
+    length = out_len;
+  } else
+#endif
   // Add in parts of the FM buffer not yet done
   if (length-fmlen > 0 && PicoIn.sndOut) {
     s32 *fmbuf = buf32 + ((fmlen-offset) << stereo);

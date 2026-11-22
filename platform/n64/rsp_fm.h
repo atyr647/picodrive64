@@ -42,6 +42,6 @@ struct rsp_fm_state {
 }; /* 340 bytes */
 
 void rsp_fm_init(void);
-void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf);
+void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf, int reset);
 
 #endif

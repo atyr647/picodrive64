@@ -86,14 +86,14 @@ void rsp_fm_test_noop(void)
 	rspq_wait();
 }
 
-void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf)
+void rsp_fm_render(struct rsp_fm_state *state, int32_t *out_buf, int reset)
 {
 	upload_tables();
 
 	data_cache_hit_writeback(state, (sizeof(*state) + 15) & ~15);
 
 	rspq_write(fm_ovl_id, CMD_FM_RENDER,
-		   state->num_samples,
+		   state->num_samples | (reset ? 0x10000 : 0),
 		   PhysicalAddr(state),
 		   PhysicalAddr(out_buf));
 	rspq_flush();

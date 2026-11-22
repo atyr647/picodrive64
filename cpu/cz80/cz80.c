@@ -278,6 +278,9 @@ Cz80_Exec:
 	{
 Cz80_Exec_nocheck:
 		data = pzHL;
+#ifdef Z80_PCHIST
+		{ extern unsigned int z80_pchist[0x2000]; z80_pchist[zRealPC & 0x1fff]++; }
+#endif
 		Opcode = READ_OP();
 #if CZ80_EMULATE_R_EXACTLY
 		zR++;
