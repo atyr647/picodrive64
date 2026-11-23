@@ -866,6 +866,102 @@ static FAMEC_EXTRA_INLINE u32 execute_exception_group_0(M68K_CONTEXT *ctx, s32 v
 #include "famec_opcodes.h"
 #endif
 
+#if defined(FAME_LOOP_ACCEL) && defined(FAMEC_NO_GOTOS)
+/* Native fast-forward of one hot loop shape, wherever its exact code is
+ * found (Lightening Force builds its plane nametables with it: ~25% of all
+ * its 68k instructions):
+ *   L: move.l (a1)+,d0 / and.l d1,d0 / or.l d2,d0 / move.l d0,(a0)+   x4
+ *      dbf d7,L
+ * Entered from the handler of the move.l (a1)+,d0 at L.  It does exactly
+ * what the handlers would, instruction by instruction: the same register
+ * and memory effects, the same cycles (OP_0x2018 12, OP_0xC080 8,
+ * OP_0x8080 8, OP_0x20C0 12, OP_0x51C8 10 taken / 14 not), stopping after
+ * the instruction that takes io_cycle_counter to <= 0 like the dispatch
+ * loop.  Memory accesses use the same map lookups as m68k_read32 /
+ * m68k_write32; at one that would call an I/O handler it stops before that
+ * instruction and leaves it to the handlers.  Flags: each of the move/and/
+ * or instructions sets N and Z from the new d0 and clears V and C; dbf
+ * changes none, so the final flags follow from the final d0. */
+extern M68K_CONTEXT PicoCpuFM68k;
+extern uptr m68k_read16_map[], m68k_write16_map[];
+#define LA_MAP_FLAG ((uptr)1 << (sizeof(uptr) * 8 - 1))
+
+static const u16 la_code[18] = {
+	0x2019, 0xc081, 0x8082, 0x20c0, 0x2019, 0xc081, 0x8082, 0x20c0,
+	0x2019, 0xc081, 0x8082, 0x20c0, 0x2019, 0xc081, 0x8082, 0x20c0,
+	0x51cf, 0xffde
+};
+
+static void OP_loop_accel_2019(M68K_CONTEXT *ctx)
+{
+	u16 *code = PC - 1;		/* L: this move.l (a1)+,d0 */
+	u32 d0, d1, d2, a0, a1, a;
+	u16 d7, *m;
+	uptr v;
+	s32 cnt;
+	int i, n = 0, dbf = 0, off;
+
+	if (code[1] != 0xc081 || ctx != &PicoCpuFM68k)
+		goto generic;
+	for (i = 2; i < 18; i++)
+		if (code[i] != la_code[i])
+			goto generic;
+#ifdef FAMEC_EMULATE_TRACE
+	if (ctx->execinfo & FM68K_EMULATE_TRACE)
+		goto generic;
+#endif
+
+	d0 = DREGu32(0); d1 = DREGu32(1); d2 = DREGu32(2);
+	a0 = AREG(0); a1 = AREG(1); d7 = DREGu16(7);
+	cnt = ctx->io_cycle_counter;
+	for (;;) {
+		for (i = 0; i < 4; i++) {
+			off = 8 * i;				/* move.l (a1)+,d0 */
+			a = a1 & 0x00fffffe;
+			v = m68k_read16_map[a >> 16];
+			if (v & LA_MAP_FLAG) goto stop;
+			m = (u16 *)((v << 1) + a);
+			d0 = (m[0] << 16) | m[1];
+			a1 += 4; n++;
+			off += 2; if ((cnt -= 12) <= 0) goto stop;
+			d0 &= d1;				/* and.l d1,d0 */
+			off += 2; if ((cnt -= 8) <= 0) goto stop;
+			d0 |= d2;				/* or.l d2,d0 */
+			off += 2; if ((cnt -= 8) <= 0) goto stop;
+			a = a0 & 0x00fffffe;			/* move.l d0,(a0)+ */
+			v = m68k_write16_map[a >> 16];
+			if (v & LA_MAP_FLAG) goto stop;
+			m = (u16 *)((v << 1) + a);
+			m[0] = d0 >> 16; m[1] = d0;
+			a0 += 4;
+			off += 2; if ((cnt -= 12) <= 0) goto stop;
+		}
+		dbf = 1;					/* dbf d7,L */
+		if (--d7 != 0xffff) {
+			off = 0; if ((cnt -= 10) <= 0) goto stop;
+			continue;
+		}
+		cnt -= 14; off = 36;
+		break;
+	}
+stop:
+	if (n == 0)
+		goto generic;	/* I/O at the very first access */
+	DREGu32(0) = d0; AREG(0) = a0; AREG(1) = a1; DREGu16(7) = d7;
+	flag_C = 0; flag_V = 0;
+	flag_NotZ = d0; flag_N = d0 >> 24;
+#ifdef PICODRIVE_HACK
+	if (dbf)
+		ctx->not_polling = 1;	/* NOT_POLLING in OP_0x51C8 */
+#endif
+	ctx->io_cycle_counter = cnt;
+	PC = code + off / 2;
+	return;
+generic:
+	OP_0x2018(ctx);
+}
+#endif /* FAME_LOOP_ACCEL */
+
 
 // main exec function
 //////////////////////
@@ -5071,6 +5167,9 @@ static int init_jump_table(void)
 	JumpTable[0xE7E7] = CAST_OP(0xE7E7);
 	for(i = 0x0000; i <= 0x0FFF; i += 0x0001)
 		JumpTable[0xF000 + i] = CAST_OP(0xF000);
+#if defined(FAME_LOOP_ACCEL) && defined(FAMEC_NO_GOTOS)
+	JumpTable[0x2019] = (opcode_func)&OP_loop_accel_2019;
+#endif
 
 	initialised = 1;
 	return 0;

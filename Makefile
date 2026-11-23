@@ -308,6 +308,9 @@ CFLAGS += -DN64_BENCH
 # Skip 68k timeslices that would only spin in a detected idle loop
 # (cpu/fame/famec.c fm68k_emulate_idle; exact, see comment there).
 CFLAGS += -DFAME_IDLE_SKIP
+# Run one hot 68k loop shape natively where its exact code is found
+# (cpu/fame/famec.c OP_loop_accel_2019; exact, see comment there).
+CFLAGS += -DFAME_LOOP_ACCEL
 N64_Z80_ACCEL ?= 1
 ifeq "$(N64_Z80_ACCEL)" "1"
 CFLAGS += -DZ80_DRIVER_ACCEL
