@@ -43,7 +43,41 @@ vdp_dummy:  .word 0
     RSPQ_EndSavedState
 
     .align 3
-rowoff:     .half 0*BW, 1*BW, 2*BW, 3*BW, 4*BW, 5*BW, 6*BW, 7*BW
+    # per value u of a command's yrel field (yrel = u < 8 ? u : u - 16):
+    # band row offset (band row * BW), first tile row * 4, rows to draw
+ytab:
+    .half 0*BW
+    .byte 0, 8
+    .half 1*BW
+    .byte 0, 7
+    .half 2*BW
+    .byte 0, 6
+    .half 3*BW
+    .byte 0, 5
+    .half 4*BW
+    .byte 0, 4
+    .half 5*BW
+    .byte 0, 3
+    .half 6*BW
+    .byte 0, 2
+    .half 7*BW
+    .byte 0, 1
+    .half 0             # yrel -8: not used
+    .byte 0, 0
+    .half 0
+    .byte 28, 1
+    .half 0
+    .byte 24, 2
+    .half 0
+    .byte 20, 3
+    .half 0
+    .byte 16, 4
+    .half 0
+    .byte 12, 5
+    .half 0
+    .byte 8, 6
+    .half 0
+    .byte 4, 7
 
     .bss
     .align 3
@@ -54,8 +88,11 @@ cmdbuf:     .space 256
 cnts:       .space 128
 bfill:      .word 0
 lbase:      .word 0
+tcur:       .word 0             # tile buffer of the next command (tileA/B)
+tpre:       .word 0             # its tile DMA was already started
     .align 3
-tilebuf:    .space 32
+tileA:      .space 32           # two tile buffers: one drawn, one loading
+tileB:      .space 32
 
     .text
 
@@ -68,7 +105,9 @@ tilebuf:    .space 32
     #   sp = count of the current list (DMEM, cnts + 2 * (band*2 + hi))
     #   k0 = 0x00FF00FF   fp = 0x0F0F0F0F   v1 = 0x01010101
     #   per command: a0 cmd, a1 dst, a2 pal x4, a3 rows left,
-    #                t3 src row, t4 src step, s0/s4/t0/t1/t2/at for DMA
+    #                t3 src row, t4 src step, t6 tile buffer, s0 x flip,
+    #                at 0x80808080 (zero-byte test), t0-t2 MERGE4 temps;
+    #                s0/s4/t0/t1/t2/at are also the DMA routines' registers
     ##########################################################################
 
     # next command of the list -> reg; refills cmdbuf with the next
@@ -94,36 +133,34 @@ tilebuf:    .space 32
         addiu   s3, s3, 4
     .endm
 
-    # draw 4 pixels: \h = 16-bit (p0..p3 nibbles), at \off(a1)
-    .macro PIX4 h, off
-        sll     t7, \h, 8
-        or      t7, t7, \h
-        and     t7, t7, k0              # p0p1 in 23-16, p2p3 in 7-0
-        sll     t8, t7, 4
-        or      t7, t7, t8
-        and     t7, t7, fp              # bytes p0 p1 p2 p3
-        srl     t8, t7, 1
-        or      t9, t7, t8
-        srl     t8, t7, 2
-        or      t9, t9, t8
-        srl     t8, t7, 3
-        or      t9, t9, t8
-        and     t9, t9, v1              # 1 per non-transparent pixel
-        beqz    t9, 3f
-        sll     t8, t9, 8
-        subu    t8, t8, t9              # 0xFF per non-transparent pixel
-        addiu   t9, t8, 1
-        bnez    t9, 2f                  # not all opaque
-        or      t7, t7, a2              # | palette
+    # 4 pixels: \x = their nibbles spread to bytes (0..15), drawn at
+    # \off(a1): nibble 0 is transparent, others become (pal | nibble)
+    .macro MERGE4 x, off
+        subu    t0, \x, v1
+        and     t0, t0, $1
+        bnez    t0, 1f                  # a transparent pixel
+        or      t1, \x, a2              # | palette
         b       3f
-        sw      t7, \off(a1)
-2:      lw      t9, \off(a1)
-        xor     t6, t9, t7
-        and     t6, t6, t8
-        xor     t9, t9, t6
-        sw      t9, \off(a1)
+        sw      t1, \off(a1)            # all four opaque
+1:      srl     t0, \x, 1
+        or      t2, \x, t0
+        srl     t0, \x, 2
+        or      t2, t2, t0
+        srl     t0, \x, 3
+        or      t2, t2, t0
+        and     t2, t2, v1              # 1 per opaque pixel
+        beqz    t2, 3f                  # all four transparent
+        sll     t0, t2, 8
+        subu    t0, t0, t2              # 0xFF per opaque pixel
+        lw      t2, \off(a1)
+        xor     t1, t1, t2
+        and     t1, t1, t0
+        xor     t2, t2, t1
+        sw      t2, \off(a1)
 3:
     .endm
+
+    .set noat       # at holds 0x80808080 while drawing (reloaded per command)
 
 cmd_vdp_render:
     move    v0, ra
@@ -144,6 +181,9 @@ cmd_vdp_render:
     jal     DMAIn
     li      t0, DMA_SIZE(128, 1)
     li      sp, %lo(cnts)
+    li      t8, %lo(tileA)
+    sw      t8, %lo(tcur)
+    sw      zero, %lo(tpre)
     li      k0, 0x00FF00FF
     li      fp, 0x0F0F0F0F
     li      v1, 0x01010101
@@ -184,15 +224,52 @@ cmd_loop:
     GETWORD a0
     addiu   s1, s1, -1
 
-    /* fetch the tile (32 bytes) */
+    /* this command's tile (32 bytes): DMA it unless it is already on the
+     * way, and start the next command's tile if that command is already
+     * in cmdbuf, so its DMA runs while this one is drawn */
+    lw      t6, %lo(tcur)
+    lw      t5, %lo(tpre)
+    bnez    t5, 1f
     srl     t3, a0, 13
     andi    t3, t3, 0x7FF
     sll     t3, t3, 5
     addu    s0, s5, t3
-    li      s4, %lo(tilebuf)
-    jal     DMAIn
+    move    s4, t6
+    jal     DMAInAsync
     li      t0, DMA_SIZE(32, 1)
-
+1:  move    t5, zero
+    beqz    s1, 2f
+    nop
+    beq     s3, s2, 2f
+    nop
+    lw      t7, 0(s3)
+    srl     t3, t7, 13
+    andi    t3, t3, 0x7FF
+    sll     t3, t3, 5
+    addu    s0, s5, t3
+    li      s4, %lo(tileA)
+    addiu   s4, s4, %lo(tileB)
+    subu    s4, s4, t6              # the other buffer
+    jal     DMAInAsync
+    li      t0, DMA_SIZE(32, 1)
+    li      t5, 1
+2:  sw      t5, %lo(tpre)
+    /* wait for this tile: with the next one queued behind it, until the
+     * DMA queue has room again, else until the DMA engine is idle */
+    beqz    t5, 4f
+    nop
+3:  mfc0    t8, COP0_DMA_FULL
+    bnez    t8, 3b
+    nop
+    li      t8, %lo(tileA)
+    addiu   t8, t8, %lo(tileB)
+    subu    t8, t8, t6
+    b       5f
+    sw      t8, %lo(tcur)           # the next command's tile buffer
+4:  mfc0    t8, COP0_DMA_BUSY
+    bnez    t8, 4b
+    nop
+5:
     /* palette x4 */
     srl     a2, a0, 22
     andi    a2, a2, 0x30
@@ -201,51 +278,37 @@ cmd_loop:
     sll     t8, a2, 16
     or      a2, a2, t8
 
-    /* rows: yrel in -7..7; first visible tile row i0 = max(0,-yrel),
-     * count = 8 - |yrel|, first band row = max(0, yrel) */
-    sll     t5, a0, 19
-    sra     t5, t5, 28              # yrel
-    bltz    t5, 1f
-    li      t6, 0                   # i0
-    b       2f
-    move    t7, t5                  # band row
-1:  subu    t6, zero, t5            # i0 = -yrel
-    li      t7, 0
-2:  subu    a3, zero, t5
-    bltz    t5, 3f
-    nop
-    move    a3, t5
-3:  li      t8, 8
-    subu    a3, t8, a3              # rows = 8 - |yrel|
-    blez    a3, cmd_loop
-    nop
-    /* dst = band + rowoff[band row] + x */
-    sll     t8, t7, 1
-    lhu     t8, %lo(rowoff)(t8)
+    /* rows to draw, from the yrel field (ytab) */
+    srl     t5, a0, 7
+    andi    t5, t5, 0x3C
+    lbu     a3, %lo(ytab) + 3(t5)   # rows
+    beqz    a3, cmd_loop
+    lhu     t8, %lo(ytab)(t5)       # band row * BW
+    lbu     t9, %lo(ytab) + 2(t5)   # first tile row * 4
+    /* dst = band + band row + x */
     andi    a1, a0, 0x1FF
     addu    a1, a1, t8
     addiu   a1, a1, %lo(band)
     /* src: y flip walks the tile bottom-up */
-    sll     t8, t6, 2
-    srl     t9, a0, 25
-    andi    t9, t9, 1
-    bnez    t9, 4f
+    srl     t8, a0, 25
+    andi    t8, t8, 1
+    bnez    t8, 6f
     li      t4, 4
-    b       5f
-    addiu   t3, t8, %lo(tilebuf)
-4:  li      t4, -4
-    li      t3, %lo(tilebuf) + 28
-    subu    t3, t3, t8
-5:
-    srl     t9, a0, 24
-    andi    t9, t9, 1               # x flip
-    move    s0, t9
+    b       7f
+    addu    t3, t6, t9
+6:  li      t4, -4
+    addiu   t3, t6, 28
+    subu    t3, t3, t9
+7:  srl     s0, a0, 24
+    andi    s0, s0, 1               # x flip
+    lui     $1, 0x8080
+    ori     $1, $1, 0x8080
 
 row_loop:
     lw      t5, 0(t3)
-    beqz    t5, row_next
+    beqz    t5, row_next            # all 8 transparent
     addu    t3, t3, t4
-    beqz    s0, 6f
+    beqz    s0, 8f
     nop
     /* x flip: reverse the 8 nibbles */
     srl     t6, t5, 16
@@ -261,10 +324,35 @@ row_loop:
     and     t5, t5, fp
     sll     t6, t6, 4
     or      t5, t5, t6
-6:  srl     t6, t5, 16
-    PIX4    t6, 0
+8:  /* spread the nibbles to bytes: t7 = p0..p3, t6 = p4..p7 */
+    srl     t6, t5, 16
+    sll     t7, t6, 8
+    or      t7, t7, t6
+    and     t7, t7, k0
+    sll     t8, t7, 4
+    or      t7, t7, t8
+    and     t7, t7, fp
     andi    t6, t5, 0xFFFF
-    PIX4    t6, 4
+    sll     t8, t6, 8
+    or      t6, t6, t8
+    and     t6, t6, k0
+    sll     t8, t6, 4
+    or      t6, t6, t8
+    and     t6, t6, fp
+    /* all 8 opaque (no zero byte; bytes are < 16, so no false alarm)? */
+    subu    t8, t7, v1
+    subu    t9, t6, v1
+    or      t8, t8, t9
+    and     t8, t8, $1
+    bnez    t8, 9f
+    nop
+    or      t7, t7, a2
+    or      t6, t6, a2
+    sw      t7, 0(a1)
+    b       row_next
+    sw      t6, 4(a1)
+9:  MERGE4  t7, 0
+    MERGE4  t6, 4
 row_next:
     addiu   a3, a3, -1
     bnez    a3, row_loop
@@ -330,4 +418,4 @@ copy_done:
     jr      v0
     nop
 
-
+    .set at
