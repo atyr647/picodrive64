@@ -277,6 +277,7 @@ CFLAGS += -include $(CURDIR)/platform/n64/posix_compat.h
 # the meta data at runtime.
 LDFLAGS += -Wl,--defsym=rsp_audio_meta_start=0,--defsym=rsp_audio_meta_end=0
 LDFLAGS += -Wl,--defsym=rsp_fm_meta_start=0,--defsym=rsp_fm_meta_end=0
+LDFLAGS += -Wl,--defsym=rsp_vdp_meta_start=0,--defsym=rsp_vdp_meta_end=0
 # Same newer libdragon versions moved __retarget_lock_* hooks into
 # newlib libc.a while libdragonsys.a still defines them, so they
 # collide at link.  Allow the duplicates; they're functionally
@@ -337,12 +338,19 @@ DRC_68K ?= 0
 # RSP audio overlay + FM synthesis overlay
 OBJS += platform/n64/rsp_audio_ovl.o platform/n64/rsp_audio.o
 OBJS += platform/n64/rsp_fm_ovl.o platform/n64/rsp_fm.o
+# RSP tile renderer (draw2 emits commands, rsp_vdp.S draws them)
+N64_RSP_VDP ?= 1
+ifeq "$(N64_RSP_VDP)" "1"
+CFLAGS += -DN64_RSP_VDP
+OBJS += platform/n64/rsp_vdp_ovl.o platform/n64/rsp_vdp.o
+endif
 # RSP overlay C wrappers must not use LTO - the DEFINE_RSP_UCODE symbols
 # get garbage-collected when LTO can't see the overlay binary references
 # RSP overlay C wrappers and main must not use LTO - DEFINE_RSP_UCODE
 # symbols get garbage-collected when LTO can't trace overlay binary refs
 platform/n64/rsp_fm.o: CFLAGS += -fno-lto
 platform/n64/rsp_audio.o: CFLAGS += -fno-lto
+platform/n64/rsp_vdp.o: CFLAGS += -fno-lto
 platform/n64/main_n64.o: CFLAGS += -fno-lto
 # Cz80 is one ~30KB computed-goto function, ~2x the 16KB I-cache: -O3's
 # unrolling/inlining makes its hot handlers conflict more.  Measured with

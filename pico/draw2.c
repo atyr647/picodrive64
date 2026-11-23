@@ -72,6 +72,18 @@ static unsigned char *clip_lo = (unsigned char *)0;
 static unsigned char *clip_hi = (unsigned char *)~(uintptr_t)0;
 /* the same band as framebuffer row indices, for the tile row clip */
 static int band_r0 = 0, band_r1 = 1 << 30;
+#ifdef N64_RSP_VDP
+/* Emit mode: instead of drawing, every tile (row) draw becomes a command
+ * word for the RSP renderer (platform/n64/rsp_vdp.S), band by band (8-line
+ * bands, the RSP's DMEM band buffer).  Same traversal, same order. */
+#include "../platform/n64/rsp_vdp.h"
+#include <n64sys.h>   /* data_cache_hit_writeback_invalidate */
+int draw2_rsp;                         /* set by the platform: use the RSP */
+#define RSP_STREAM_WORDS (64 * 1024)   /* > worst case (~43k commands + headers) */
+static u32 rsp_stream[RSP_STREAM_WORDS + 64] __attribute__((aligned(16)));
+static u32 *rsp_cmdp;
+static int draw2_emit;
+#endif
 /* does the 8-line tile row starting at p intersect the clip band? */
 #define ROW_VIS(p, stride) ((p) + 8*(stride) > clip_lo && (p) < clip_hi)
 #else
@@ -159,14 +171,26 @@ static inline int TileRowsN64(unsigned char *pd, int addr, unsigned char pal,
 	return blank;
 }
 
+#ifdef N64_RSP_VDP
+/* command word, see rsp_vdp.S */
+#define TILE_EMIT(xf, yf) \
+	if (draw2_emit) { \
+		*rsp_cmdp++ = (u32)((pd - est->Draw2FB) - y * est->Draw2Width) \
+			| ((u32)(y - band_r0) & 15) << 9 | (((u32)addr >> 4) & 0x7ff) << 13 \
+			| (u32)(pal >> 4) << 24 | (xf) << 26 | (yf) << 27; \
+		return 0; \
+	}
+#else
+#define TILE_EMIT(xf, yf)
+#endif
 static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ return TileRowsN64(pd, addr, pal, est, 0, 2, y); }
+{ TILE_EMIT(0, 0) return TileRowsN64(pd, addr, pal, est, 0, 2, y); }
 static int TileXflipYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ return TileRowsN64(pd, addr, pal, est, 1, 2, y); }
+{ TILE_EMIT(1, 0) return TileRowsN64(pd, addr, pal, est, 1, 2, y); }
 static int TileXnormYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ return TileRowsN64(pd, addr + 14, pal, est, 0, -2, y); }
+{ TILE_EMIT(0, 1) return TileRowsN64(pd, addr + 14, pal, est, 0, -2, y); }
 static int TileXflipYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ return TileRowsN64(pd, addr + 14, pal, est, 1, -2, y); }
+{ TILE_EMIT(1, 1) return TileRowsN64(pd, addr + 14, pal, est, 1, -2, y); }
 
 #else
 static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
@@ -830,14 +854,27 @@ static void DrawDisplayFull(void)
 	u32 *spr_lo[80], *spr_hi[80];
 	int n_lo = (pvid->debug_p & PVD_KILL_S_LO) ? 0 : CollectSpritesFull(0, maxw, est, spr_lo);
 	int n_hi = (pvid->debug_p & PVD_KILL_S_HI) ? 0 : CollectSpritesFull(1, maxw, est, spr_hi);
-	int band_y, fb_end = 8 + (END_ROW-START_ROW)*8;
-	for (band_y = 8; band_y < fb_end; band_y += DRAW2_BAND) {
-	int band_y1 = band_y + DRAW2_BAND < fb_end ? band_y + DRAW2_BAND : fb_end;
+	int band_y, fb_end = 8 + (END_ROW-START_ROW)*8, band_h = DRAW2_BAND;
+#ifdef N64_RSP_VDP
+	u32 *rsp_hdr = 0;
+	draw2_emit = draw2_rsp;
+	if (draw2_emit) {
+		band_h = 8;
+		rsp_cmdp = rsp_stream;
+	}
+#endif
+	for (band_y = 8; band_y < fb_end; band_y += band_h) {
+	int band_y1 = band_y + band_h < fb_end ? band_y + band_h : fb_end;
 	int si;
 	clip_lo = est->Draw2FB + band_y  * est->Draw2Width;
 	clip_hi = est->Draw2FB + band_y1 * est->Draw2Width;
 	band_r0 = band_y;
 	band_r1 = band_y1;
+#ifdef N64_RSP_VDP
+	if (draw2_emit)
+		rsp_hdr = rsp_cmdp++;
+	else
+#endif
 	BackFillRows(est->Draw2FB, pvid->reg[7], est->Draw2Width, band_y, band_y1);
 #endif
 	HighCache2A[0] = HighCache2B[0] = 0;
@@ -906,7 +943,25 @@ static void DrawDisplayFull(void)
 	for (si = n_hi - 1; si >= 0; si--)
 		DrawSpriteFull(spr_hi[si], est);
 	PROF2_SPR();
+#ifdef N64_RSP_VDP
+	if (draw2_emit)
+		*rsp_hdr = (u32)(rsp_cmdp - rsp_hdr - 1) | (u32)(pvid->reg[7] & 0x3f) << 16;
+#endif
 	}  /* band loop */
+#ifdef N64_RSP_VDP
+	if (draw2_emit) {
+		/* the RSP writes framebuffer rows 8..fb_end-1 by DMA: no dirty
+		 * CPU copy of them may be written back over its output later */
+		data_cache_hit_writeback_invalidate(est->Draw2FB + 8 * est->Draw2Width,
+		                                    (fb_end - 8) * est->Draw2Width);
+		rsp_vdp_render(rsp_stream, rsp_cmdp - rsp_stream, (fb_end - 8) / 8,
+		               est->Draw2FB + 8 * est->Draw2Width + 8, est->PicoMem_vram);
+#ifdef RSP_VDP_SYNC
+		rsp_vdp_wait();
+#endif
+		draw2_emit = 0;
+	}
+#endif
 	clip_lo = (unsigned char *)0;
 	clip_hi = (unsigned char *)~(uintptr_t)0;
 	band_r0 = 0;
@@ -922,6 +977,9 @@ static void DrawDisplayFull(void)
 PICO_INTERNAL void PicoFrameFull(void)
 {
 	pprof_start(draw);
+#ifdef N64_RSP_VDP
+	rsp_vdp_wait();   /* previous RSP render: framebuffer and stream are reused */
+#endif
 
 	// prepare cram?
 	if (PicoPrepareCram) PicoPrepareCram();
@@ -938,6 +996,30 @@ PICO_INTERNAL void PicoFrameFull(void)
 		DrawDisplayFull();
 #endif
 
+#if defined(N64_RSP_VDP) && defined(RSP_VDP_CHECK)
+	/* verification: render the same frame on the CPU and compare */
+	if (draw2_rsp && (Pico.video.reg[1] & 0x40)) {
+		static unsigned char shadow[328 * 240] __attribute__((aligned(16)));
+		static int reported;
+		unsigned char *fb = Pico.est.Draw2FB;
+		int y, x, n = 0;
+		rsp_vdp_wait();
+		data_cache_hit_invalidate(fb + 8 * 328, 224 * 328);
+		Pico.est.Draw2FB = shadow;
+		draw2_rsp = 0;
+		DrawDisplayFull();
+		draw2_rsp = 1;
+		Pico.est.Draw2FB = fb;
+		for (y = 8; y < 232 && n < 12; y++)
+			for (x = 8; x < 328 && n < 12; x++)
+				if (fb[y * 328 + x] != shadow[y * 328 + x]) {
+					if (reported < 40)
+						{ extern void n64_logf(const char *, ...); n64_logf("[VCHK] f=%u y=%d x=%d cpu=%02x rsp=%02x\n", Pico.m.frame_count,
+						       y, x, shadow[y * 328 + x], fb[y * 328 + x]); }
+					n++; reported++;
+				}
+	}
+#endif
 	// clear top and bottom 8 lines in 240 mode, since draw2 only does 224
 	if (Pico.est.rendstatus & PDRAW_30_ROWS) {
 		unsigned char *pd = Pico.est.Draw2FB;

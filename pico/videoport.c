@@ -892,6 +892,12 @@ PICO_INTERNAL_ASM void PicoVideoWrite(u32 a,unsigned short d)
 {
   struct PicoVideo *pvid=&Pico.video;
 
+#ifdef N64_RSP_VDP
+  // the RSP renderer reads a VRAM snapshot: let it be taken first
+  { extern volatile int rsp_vdp_copy_pending; extern void rsp_vdp_wait_copy(void);
+    if (rsp_vdp_copy_pending) rsp_vdp_wait_copy(); }
+#endif
+
   //elprintf(EL_STATUS, "PicoVideoWrite [%06x] %04x [%u] @ %06x",
   //  a, d, SekCyclesDone(), SekPc);
 

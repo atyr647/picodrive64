@@ -25,6 +25,7 @@
 #include <rdpq_tex.h>
 #include "rsp_audio.h"
 #include "rsp_fm.h"
+#include "rsp_vdp.h"
 #include "emux.h"
 #ifdef DRC_68K
 #include "../../cpu/drc/drc68k.h"
@@ -426,6 +427,10 @@ int main(int argc, char *argv[])
 	audio_init(SND_RATE, 4);
 	rsp_audio_init();  /* Register RSP audio overlay with rspq */
 	rsp_fm_init();     /* Register RSP FM synthesis overlay */
+#ifdef N64_RSP_VDP
+	rsp_vdp_init();    /* RSP tile renderer, fed by draw2 */
+	{ extern int draw2_rsp; draw2_rsp = 1; }
+#endif
 	joypad_init();
 
 	/* Boot message */
@@ -819,7 +824,19 @@ int main(int argc, char *argv[])
 #ifdef BENCH_FBHASH
 				{   /* verification builds: hash every rendered frame's visible pixels */
 					extern uint32_t bench_fb_hash; extern unsigned int bench_fb_n;
+#ifdef N64_RSP_VDP
+					rsp_vdp_wait();
+					data_cache_hit_writeback_invalidate(screen_buffer + 8*SCR_PITCH, 224*SCR_PITCH);
+#endif
 					const uint8_t *row = screen_buffer + 8*SCR_PITCH + 8;
+#ifdef FBHASH_LOG
+					uint32_t fh = 2166136261u;
+					const uint8_t *r2 = row;
+					for (int yy = 0; yy < h; yy++, r2 += SCR_PITCH)
+						for (int xx = 0; xx < w; xx++)
+							fh = (fh ^ r2[xx]) * 16777619u;
+					debugf("[FH] %u %08lx\n", Pico.m.frame_count, (unsigned long)fh);
+#endif
 					for (int yy = 0; yy < h; yy++, row += SCR_PITCH)
 						for (int xx = 0; xx < w; xx++)
 							bench_fb_hash = (bench_fb_hash ^ row[xx]) * 16777619u;
@@ -1004,6 +1021,9 @@ post_render: ;
 						ym2612.OPN.ST.status, ym2612.dacout };
 					zh = bench_hash(t, sizeof(t), zh);
 					debugf("[ZSTATE] zhash=%08lx\n", (unsigned long)zh);
+#ifdef N64_RSP_VDP
+					{ extern unsigned int rsp_vdp_stat[4]; debugf("[RSPVDP] renders=%u blocked=%u waited=%lu us total, copy waits %lu us\n", rsp_vdp_stat[2], rsp_vdp_stat[0], (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[1]), (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[3])); }
+#endif
 				}
 				uint32_t h = bench_hash(PicoMem.ram, 0x10000, 2166136261u);
 				h = bench_hash(PicoMem.vram, 0x10000, h);
@@ -1038,6 +1058,17 @@ void emu_video_mode_change(int start_line, int line_count, int start_col, int co
 
 void emu_32x_startup(void) { }
 void lprintf(const char *fmt, ...) { }
+#include <stdarg.h>
+/* debugf for files built with NDEBUG (core), e.g. verification output */
+void n64_logf(const char *fmt, ...)
+{
+	char buf[256];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	debugf("%s", buf);
+}
 
 void *plat_mmap(unsigned long addr, size_t size, int need_exec, int is_fixed)
 { return calloc(1, size); }
