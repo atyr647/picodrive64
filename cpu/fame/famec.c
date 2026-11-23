@@ -267,21 +267,25 @@ extern unsigned int emux_fame_instrs;
 #else
 #define FAME_PCHIST_HOOK
 #endif
+/* handlers get the opcode as an argument and return the cycles they took
+ * (they may also change io_cycle_counter themselves, e.g. RET0, or memory
+ * handlers that end or stretch the timeslice: the subtraction happens
+ * after the call, on the counter as they left it) */
 #define NEXT \
     do { \
+        u32 op_; \
         FAME_PCHIST_HOOK \
-        FETCH_WORD(Opcode); \
-        JumpTable[Opcode](ctx); \
+        FETCH_WORD(op_); \
+        ctx->io_cycle_counter -= JumpTable[op_](ctx, op_); \
     } while (ctx->io_cycle_counter > 0);
 
 #define RET(A) { \
-    ctx->io_cycle_counter -= (A);  \
-    return; \
+    return (A); \
 }
 
 #define RET0() { \
     ctx->io_cycle_counter = -6; \
-    return; \
+    return 0; \
 }
 
 #endif
@@ -494,7 +498,7 @@ extern unsigned int emux_fame_instrs;
 #ifdef FAMEC_CHECK_BRANCHES
 
 #ifdef FAMEC_NO_GOTOS
-#define CHECK_BRANCH_EXCEPTION_GOTO_END ctx->io_cycle_counter=0; return;
+#define CHECK_BRANCH_EXCEPTION_GOTO_END ctx->io_cycle_counter=0; return 0;
 #else
 #define CHECK_BRANCH_EXCEPTION_GOTO_END goto famec_Exec_End;
 #endif
@@ -513,7 +517,7 @@ extern unsigned int emux_fame_instrs;
 #endif
 
 #ifdef FAMEC_NO_GOTOS
-#define Opcode ctx->Opcode
+#define Opcode op_
 #define cycles_needed ctx->cycles_needed
 #define PC ctx->PC
 #define BasePC ctx->BasePC
@@ -538,7 +542,11 @@ extern M68K_CONTEXT PicoCpuFS68k;
 #endif
 
 /* Custom function handler */
+#ifdef FAMEC_NO_GOTOS
+typedef u32 (*opcode_func)(M68K_CONTEXT *ctx, u32 op_);
+#else
 typedef void (*opcode_func)(M68K_CONTEXT *ctx);
+#endif
 
 static opcode_func JumpTable[0x10000];
 
@@ -861,7 +869,7 @@ static FAMEC_EXTRA_INLINE u32 execute_exception_group_0(M68K_CONTEXT *ctx, s32 v
 
 #ifdef FAMEC_NO_GOTOS
 
-#define OPCODE(N_OP) static void OP_##N_OP(M68K_CONTEXT *ctx)
+#define OPCODE(N_OP) static u32 OP_##N_OP(M68K_CONTEXT *ctx, u32 op_)
 #define CAST_OP(N_OP) (opcode_func)&OP_##N_OP
 #include "famec_opcodes.h"
 #endif
@@ -892,7 +900,7 @@ static const u16 la_code[18] = {
 	0x51cf, 0xffde
 };
 
-static void OP_loop_accel_2019(M68K_CONTEXT *ctx)
+static u32 OP_loop_accel_2019(M68K_CONTEXT *ctx, u32 op_)
 {
 	u16 *code = PC - 1;		/* L: this move.l (a1)+,d0 */
 	u32 d0, d1, d2, a0, a1, a;
@@ -956,9 +964,9 @@ stop:
 #endif
 	ctx->io_cycle_counter = cnt;
 	PC = code + off / 2;
-	return;
+	return 0;
 generic:
-	OP_0x2018(ctx);
+	return OP_0x2018(ctx, op_);
 }
 #endif /* FAME_LOOP_ACCEL */
 
