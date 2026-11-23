@@ -288,7 +288,11 @@ LDFLAGS += -Wl,-z,muldefs
 # by simulating the direct-mapped caches over traced gameplay.  Disable with
 # N64_HOT_ORDER=0; N64_ORDER_FILE selects another ordering file.
 N64_HOT_ORDER ?= 1
-N64_ORDER_FILE ?= platform/n64/layout.ld
+# Per-game layout: platform/n64/layouts/<id>.ld for the embedded ROM if there
+# is one (id = EMBEDDED_ROM_NAME lowercased, non-alphanumerics -> _), else
+# platform/n64/layout.ld (trained on Gley Lancer).
+N64_ROM_ID := $(shell sed -n 's/^\#define EMBEDDED_ROM_NAME "\(.*\)"/\1/p' platform/n64/embedded_rom.h 2>/dev/null | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9]\+/_/g; s/^_//; s/_$$//')
+N64_ORDER_FILE ?= $(if $(wildcard platform/n64/layouts/$(N64_ROM_ID).ld),platform/n64/layouts/$(N64_ROM_ID).ld,platform/n64/layout.ld)
 ifeq "$(N64_HOT_ORDER)" "1"
 LDFLAGS += -Wl,--section-ordering-file=$(N64_ORDER_FILE)
 endif

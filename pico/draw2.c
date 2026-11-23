@@ -70,11 +70,18 @@ void DrawSpriteFull(unsigned int *sprite, struct PicoEState *est);
 #define BANDED (DRAW2_BAND > 0)
 static unsigned char *clip_lo = (unsigned char *)0;
 static unsigned char *clip_hi = (unsigned char *)~(uintptr_t)0;
+/* the same band as framebuffer row indices, for the tile row clip */
+static int band_r0 = 0, band_r1 = 1 << 30;
 /* does the 8-line tile row starting at p intersect the clip band? */
 #define ROW_VIS(p, stride) ((p) + 8*(stride) > clip_lo && (p) < clip_hi)
 #else
 #define BANDED 0
 #define ROW_VIS(p, stride) 1
+#endif
+#if defined(N64) && !INTERLACE
+#define TILE_Y(y) , (y)   /* tile functions also get the tile row's top framebuffer row */
+#else
+#define TILE_Y(y)
 #endif
 
 #if defined(N64) && !INTERLACE
@@ -118,33 +125,48 @@ static inline void put8(unsigned char *pd, u64_t x, u64_t pal8)
 	__builtin_memcpy(pd, &d, 8);
 }
 
-/* flip: 0 normal, 1 X flip; ystep: +2 normal, -2 Y flip (addr preset) */
+/* flip: 0 normal, 1 X flip; ystep: +2 normal, -2 Y flip (addr preset).
+ * y: framebuffer row of the tile's top row.  Only rows inside the band
+ * [band_r0, band_r1) are visited: the range is found once per tile rather
+ * than testing every row.  A tile is reported blank (callers cache that per
+ * tile code) only when all 8 rows were checked; a partly clipped tile is
+ * never reported blank, which only costs a redraw of nothing. */
 static inline int TileRowsN64(unsigned char *pd, int addr, unsigned char pal,
-			      struct PicoEState *est, int xflip, int ystep)
+			      struct PicoEState *est, int xflip, int ystep, int y)
 {
 	const unsigned short *vram = est->PicoMem_vram;
 	u64_t pal8 = (u64_t)pal * 0x0101010101010101ULL;
 	int i, stride = est->Draw2Width, blank = 1;
+	int i0 = band_r0 - y, i1 = band_r1 - y;
 
-	for (i = 8; i; i--, addr += ystep, pd += stride) {
+	if (i0 > 0) {
+		pd += i0 * stride;
+		addr += i0 * ystep;
+		blank = 0;
+	} else
+		i0 = 0;
+	if (i1 < 8)
+		blank = 0;
+	else
+		i1 = 8;
+	for (i = i1 - i0; i > 0; i--, addr += ystep, pd += stride) {
 		u32 w = *(const u32 *)(vram + addr);
 		if (!w) continue;
-		blank = 0;   /* judged on all 8 rows, clipped or not: callers cache it */
-		if (pd < clip_lo || pd >= clip_hi) continue;
+		blank = 0;
 		if (xflip) w = nibrev32(w);
 		put8(pd, spread8(w), pal8);
 	}
 	return blank;
 }
 
-static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
-{ return TileRowsN64(pd, addr, pal, est, 0, 2); }
-static int TileXflipYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
-{ return TileRowsN64(pd, addr, pal, est, 1, 2); }
-static int TileXnormYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
-{ return TileRowsN64(pd, addr + 14, pal, est, 0, -2); }
-static int TileXflipYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
-{ return TileRowsN64(pd, addr + 14, pal, est, 1, -2); }
+static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
+{ return TileRowsN64(pd, addr, pal, est, 0, 2, y); }
+static int TileXflipYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
+{ return TileRowsN64(pd, addr, pal, est, 1, 2, y); }
+static int TileXnormYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
+{ return TileRowsN64(pd, addr + 14, pal, est, 0, -2, y); }
+static int TileXflipYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
+{ return TileRowsN64(pd, addr + 14, pal, est, 1, -2, y); }
 
 #else
 static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
@@ -318,10 +340,10 @@ static void DrawWindowFull(int start, int end, int prio, struct PicoEState *est)
 			pal=(unsigned char)((code>>9)&0x30);
 
 			switch((code>>11)&3) {
-				case 0: zero=TileXnormYnorm(scrpos+(tilex<<3),addr,pal,est); break;
-				case 1: zero=TileXflipYnorm(scrpos+(tilex<<3),addr,pal,est); break;
-				case 2: zero=TileXnormYflip(scrpos+(tilex<<3),addr,pal,est); break;
-				case 3: zero=TileXflipYflip(scrpos+(tilex<<3),addr,pal,est); break;
+				case 0: zero=TileXnormYnorm(scrpos+(tilex<<3),addr,pal,est TILE_Y(8 + 8*(trow - scrstart))); break;
+				case 1: zero=TileXflipYnorm(scrpos+(tilex<<3),addr,pal,est TILE_Y(8 + 8*(trow - scrstart))); break;
+				case 2: zero=TileXnormYflip(scrpos+(tilex<<3),addr,pal,est TILE_Y(8 + 8*(trow - scrstart))); break;
+				case 3: zero=TileXflipYflip(scrpos+(tilex<<3),addr,pal,est TILE_Y(8 + 8*(trow - scrstart))); break;
 			}
 			if(zero) blank=code; // We know this tile is blank now
 		}
@@ -456,10 +478,10 @@ static void DrawLayerFull(int plane, u32 *hcache, int planestart, int planeend,
 
 			scroff=(8-(vscroll&7))*est->Draw2Width;
 			switch((code>>11)&3) {
-				case 0: zero=TileXnormYnorm(scrpos+scroff+dx,addr,pal,est); break;
-				case 1: zero=TileXflipYnorm(scrpos+scroff+dx,addr,pal,est); break;
-				case 2: zero=TileXnormYflip(scrpos+scroff+dx,addr,pal,est); break;
-				case 3: zero=TileXflipYflip(scrpos+scroff+dx,addr,pal,est); break;
+				case 0: zero=TileXnormYnorm(scrpos+scroff+dx,addr,pal,est TILE_Y(8*(trow - scrstart) + 8 - (vscroll&7))); break;
+				case 1: zero=TileXflipYnorm(scrpos+scroff+dx,addr,pal,est TILE_Y(8*(trow - scrstart) + 8 - (vscroll&7))); break;
+				case 2: zero=TileXnormYflip(scrpos+scroff+dx,addr,pal,est TILE_Y(8*(trow - scrstart) + 8 - (vscroll&7))); break;
+				case 3: zero=TileXflipYflip(scrpos+scroff+dx,addr,pal,est TILE_Y(8*(trow - scrstart) + 8 - (vscroll&7))); break;
 			}
 			if(zero) blank=code; // We know this tile is blank now
 		}
@@ -486,7 +508,9 @@ static void DrawTilesFromCacheF(u32 *hc, struct PicoEState *est)
 		scrpos += 32;
 
 	while((code=*hc++)) {
-		vscroll=(*hc++ - START_ROW*8)*est->Draw2Width;
+		int yrow;
+		yrow = *hc++ - START_ROW*8;
+		vscroll = yrow*est->Draw2Width;
 		if((short)code == blank) continue;
 
 		// y pos
@@ -494,6 +518,8 @@ static void DrawTilesFromCacheF(u32 *hc, struct PicoEState *est)
 			prevy = (unsigned)code>>27;
 			pd = scrpos + (prevy-scrstart)*est->Draw2Width*8;
 		}
+
+		yrow += (prevy-scrstart)*8;
 
 		// Get tile address/2:
 #if INTERLACE
@@ -506,10 +532,10 @@ static void DrawTilesFromCacheF(u32 *hc, struct PicoEState *est)
 		pal=(unsigned char)((code>>9)&0x30);
 
 		switch((code>>11)&3) {
-			case 0: zero=TileXnormYnorm(pd+vscroll+((code>>16)&0x1ff),addr,pal,est); break;
-			case 1: zero=TileXflipYnorm(pd+vscroll+((code>>16)&0x1ff),addr,pal,est); break;
-			case 2: zero=TileXnormYflip(pd+vscroll+((code>>16)&0x1ff),addr,pal,est); break;
-			case 3: zero=TileXflipYflip(pd+vscroll+((code>>16)&0x1ff),addr,pal,est); break;
+			case 0: zero=TileXnormYnorm(pd+vscroll+((code>>16)&0x1ff),addr,pal,est TILE_Y(yrow)); break;
+			case 1: zero=TileXflipYnorm(pd+vscroll+((code>>16)&0x1ff),addr,pal,est TILE_Y(yrow)); break;
+			case 2: zero=TileXnormYflip(pd+vscroll+((code>>16)&0x1ff),addr,pal,est TILE_Y(yrow)); break;
+			case 3: zero=TileXflipYflip(pd+vscroll+((code>>16)&0x1ff),addr,pal,est TILE_Y(yrow)); break;
 		}
 
 		if(zero) blank=(short)code;
@@ -585,10 +611,10 @@ static void DrawSpriteFull(u32 *sprite, struct PicoEState *est)
 #endif
 				s=4;
 			switch((code>>11)&3) {
-				case 0: TileXnormYnorm(scrpos+x,t<<s,pal,est); break;
-				case 1: TileXflipYnorm(scrpos+x,t<<s,pal,est); break;
-				case 2: TileXnormYflip(scrpos+x,t<<s,pal,est); break;
-				case 3: TileXflipYflip(scrpos+x,t<<s,pal,est); break;
+				case 0: TileXnormYnorm(scrpos+x,t<<s,pal,est TILE_Y(sy)); break;
+				case 1: TileXflipYnorm(scrpos+x,t<<s,pal,est TILE_Y(sy)); break;
+				case 2: TileXnormYflip(scrpos+x,t<<s,pal,est TILE_Y(sy)); break;
+				case 3: TileXflipYflip(scrpos+x,t<<s,pal,est TILE_Y(sy)); break;
 			}
 		}
 
@@ -810,6 +836,8 @@ static void DrawDisplayFull(void)
 	int si;
 	clip_lo = est->Draw2FB + band_y  * est->Draw2Width;
 	clip_hi = est->Draw2FB + band_y1 * est->Draw2Width;
+	band_r0 = band_y;
+	band_r1 = band_y1;
 	BackFillRows(est->Draw2FB, pvid->reg[7], est->Draw2Width, band_y, band_y1);
 #endif
 	HighCache2A[0] = HighCache2B[0] = 0;
@@ -881,6 +909,8 @@ static void DrawDisplayFull(void)
 	}  /* band loop */
 	clip_lo = (unsigned char *)0;
 	clip_hi = (unsigned char *)~(uintptr_t)0;
+	band_r0 = 0;
+	band_r1 = 1 << 30;
 #else
 	if (!(pvid->debug_p & PVD_KILL_S_HI))
 		DrawAllSpritesFull(1, maxw, est);
