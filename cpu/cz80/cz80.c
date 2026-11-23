@@ -378,6 +378,72 @@ static INT32 z80_driver_accel(cz80_struc *CPU)
 #undef DA_STEP
 #undef DA_RET
 }
+
+/* Lightening Force (Thunder Force IV) sound driver idle loop, 0x00cb:
+ *   00cb ld a,(0003h) / or a / jr nz,00d6h / call 0aech / jr 00cbh
+ *   0aec ld a,(4000h) / rrca / call c,0af8h / rrca / call c,0b05h / ret
+ * ~40% of its Z80 instructions.  A pass that finds the 68k command byte
+ * (0003h) = 0 and neither YM timer flag set changes nothing but the YM
+ * status (busy recomputed on every read, timer flags sticky) and writes the
+ * same return address to the same stack slot; the registers it changes
+ * (A, F) are rewritten by the next pass before being used.  So skip whole
+ * passes while none of their status reads could see a timer flag and
+ * ICount stays > 0, and leave the last pass to Cz80, which does its status
+ * read and register updates for real.  Cycle counts are cz80_op.c's.
+ * Returns the Z80 PC to continue at, or -1 (nothing done). */
+extern int ym2612_timer_flag_from(int mask);
+
+static const UINT8 tf4_code_cb[16] = {
+	0x3a,0x03,0x00, 0xb7, 0x20,0x05, 0xcd,0xec,0x0a, 0x18,0xf5,
+	0, 0, 0, 0, 0	/* not compared */
+};
+static const UINT8 tf4_code_aec[16] = {
+	0x3a,0x00,0x40, 0x0f, 0xdc,0xf8,0x0a, 0x0f, 0xdc,0x05,0x0b, 0xc9,
+	0, 0, 0, 0	/* not compared */
+};
+#define TF4_PASS_CYCLES	104	/* 13+4+7+17 + 13+4+10+4+10+10 + 12 */
+#define TF4_PASS_OPS	11
+#define TF4_READ_AT	41	/* status read: 13+4+7+17 cycles into the pass */
+
+static INT32 z80_driver_accel_tf4(cz80_struc *CPU)
+{
+	UINT8 *ram = (UINT8 *)CPU->Fetch[0];
+	unsigned long long x, y;
+	INT32 ic, k, t0, tf;
+
+	if (CPU->ICount <= 0 || CPU->ExtraCycles)
+		return -1;
+	if (CPU->Status && (CPU->Status != CZ80_HAS_INT || zIFF1))
+		return -1;
+	memcpy(&x, ram + 0xcb, 8); memcpy(&y, tf4_code_cb, 8);
+	if (x != y) return -1;
+	memcpy(&x, ram + 0xce, 8); memcpy(&y, tf4_code_cb + 3, 8);
+	if (x != y) return -1;
+	memcpy(&x, ram + 0xaec, 8); memcpy(&y, tf4_code_aec, 8);
+	if (x != y) return -1;
+	memcpy(&x, ram + 0xaf0, 8); memcpy(&y, tf4_code_aec + 4, 8);
+	if (x != y) return -1;
+	/* a command from the 68k, or a call would push outside RAM */
+	if (ram[0x0003] != 0 || zSP < 2 || zSP > 0x2000)
+		return -1;
+	tf = ym2612_timer_flag_from(3);		/* also 0 if a flag is up */
+
+	ic = CPU->ICount;
+	t0 = (INT32)Pico.t.z80c_aim - ic;	/* z80_cyclesDone() */
+	k = (ic - 1) / TF4_PASS_CYCLES;		/* passes that keep ic > 0 */
+	if (tf != 0x7fffffff) {
+		/* pass j reads the status at (t0 + READ_AT + j*c) << 8 */
+		INT32 tr = (t0 + TF4_READ_AT) << 8;
+		INT32 j = tr < tf ? (tf - tr - 1) / (TF4_PASS_CYCLES << 8) + 1 : 0;
+		if (k > j) k = j;
+	}
+	k--;		/* the last of them runs normally */
+	if (k <= 0)
+		return -1;
+	CPU->ICount = ic - k * TF4_PASS_CYCLES;
+	zR += k * TF4_PASS_OPS;
+	return 0xcb;
+}
 #endif
 
 /*--------------------------------------------------------
@@ -431,17 +497,6 @@ Cz80_Exec:
 	if (CPU->ICount > 0)
 	{
 Cz80_Exec_nocheck:
-#if PICODRIVE_HACKS && defined(Z80_DRIVER_ACCEL)
-		if (PC == CPU->Fetch[0] + 0x23)
-		{
-			INT32 npc = z80_driver_accel(CPU);
-			if (npc >= 0)
-			{
-				SET_PC(npc);
-				goto Cz80_Exec;
-			}
-		}
-#endif
 		data = pzHL;
 #ifdef Z80_PCHIST
 		{ extern unsigned int z80_pchist[0x2000]; z80_pchist[zRealPC & 0x1fff]++; }

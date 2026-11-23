@@ -73,16 +73,17 @@ static unsigned char *clip_hi = (unsigned char *)~(uintptr_t)0;
 /* the same band as framebuffer row indices, for the tile row clip */
 static int band_r0 = 0, band_r1 = 1 << 30;
 #ifdef N64_RSP_VDP
-/* Emit mode: instead of drawing, every tile (row) draw becomes a command
- * word for the RSP renderer (platform/n64/rsp_vdp.S), band by band (8-line
- * bands, the RSP's DMEM band buffer).  Same traversal, same order. */
+/* RSP mode: the pixels are drawn by the RSP (platform/n64/rsp_vdp.S); the
+ * CPU only turns the layers into per-band command lists (EmitDisplayRSP) */
 #include "../platform/n64/rsp_vdp.h"
 #include <n64sys.h>   /* data_cache_hit_writeback_invalidate */
 int draw2_rsp;                         /* set by the platform: use the RSP */
-#define RSP_STREAM_WORDS (64 * 1024)   /* > worst case (~43k commands + headers) */
-static u32 rsp_stream[RSP_STREAM_WORDS + 64] __attribute__((aligned(16)));
-static u32 *rsp_cmdp;
-static int draw2_emit;
+unsigned int draw2_rsp_ovf;            /* frames drawn on the CPU: lists full */
+unsigned int draw2_rsp_maxlist;        /* longest list so far */
+/* the CPU wrote the framebuffer since it was last written back (the
+ * platform writes it back before displaying it, and clears this) */
+int draw2_fb_dirty = 1;
+static int rsp_took;                   /* this frame is the RSP's */
 #endif
 /* does the 8-line tile row starting at p intersect the clip band? */
 #define ROW_VIS(p, stride) ((p) + 8*(stride) > clip_lo && (p) < clip_hi)
@@ -171,26 +172,14 @@ static inline int TileRowsN64(unsigned char *pd, int addr, unsigned char pal,
 	return blank;
 }
 
-#ifdef N64_RSP_VDP
-/* command word, see rsp_vdp.S */
-#define TILE_EMIT(xf, yf) \
-	if (draw2_emit) { \
-		*rsp_cmdp++ = (u32)((pd - est->Draw2FB) - y * est->Draw2Width) \
-			| ((u32)(y - band_r0) & 15) << 9 | (((u32)addr >> 4) & 0x7ff) << 13 \
-			| (u32)(pal >> 4) << 24 | (xf) << 26 | (yf) << 27; \
-		return 0; \
-	}
-#else
-#define TILE_EMIT(xf, yf)
-#endif
 static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ TILE_EMIT(0, 0) return TileRowsN64(pd, addr, pal, est, 0, 2, y); }
+{ return TileRowsN64(pd, addr, pal, est, 0, 2, y); }
 static int TileXflipYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ TILE_EMIT(1, 0) return TileRowsN64(pd, addr, pal, est, 1, 2, y); }
+{ return TileRowsN64(pd, addr, pal, est, 1, 2, y); }
 static int TileXnormYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ TILE_EMIT(0, 1) return TileRowsN64(pd, addr + 14, pal, est, 0, -2, y); }
+{ return TileRowsN64(pd, addr + 14, pal, est, 0, -2, y); }
 static int TileXflipYflip(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est, int y)
-{ TILE_EMIT(1, 1) return TileRowsN64(pd, addr + 14, pal, est, 1, -2, y); }
+{ return TileRowsN64(pd, addr + 14, pal, est, 1, -2, y); }
 
 #else
 static int TileXnormYnorm(unsigned char *pd,int addr,unsigned char pal, struct PicoEState *est)
@@ -732,6 +721,276 @@ static void DrawAllSpritesFull(int prio, int maxwidth, struct PicoEState *est)
 	}
 }
 
+
+#ifdef N64_RSP_VDP
+/* ---- RSP mode: command lists ----
+ * Each layer is walked once over the whole frame; every tile becomes one
+ * command per 8-line band it touches (a tile row at an unaligned y touches
+ * two), appended to that band's "lo" or "hi" list by priority.  The RSP
+ * draws a band's lo list, then its hi list.  Appending in the order
+ * plane B, plane A, window, low sprites, high sprites gives
+ *   lo: B lo, A lo, window (if low), sprites lo
+ *   hi: B hi, A hi, window (if high), sprites hi
+ * which is the order in which the CPU renderer draws (DrawDisplayFull),
+ * so every pixel ends up the same.  Command (see rsp_vdp.S): bits 0-8 x,
+ * 9-12 yrel = tile top - band top (-7..7), 13-27 = bits 0-14 of the VDP
+ * name / sprite attribute word (tile, x flip, y flip, palette). */
+#define RL_BANDS (END_ROW - START_ROW)  /* 8-line bands, framebuffer rows 8.. */
+#define RL_CAP   512                    /* commands per list (LIST_BYTES/4) */
+static struct {
+	u16 cnt[64];                        /* [band*2 + hi] */
+	u32 cmd[RL_BANDS * 2][RL_CAP];
+} rl __attribute__((aligned(16)));
+static u32 *rl_wp[RL_BANDS * 2];        /* append pointers */
+static u32 rl_sink[64];                 /* writes for bands off the screen */
+static int rl_ovf;
+
+/* lists of the (up to) two bands that the tile row at framebuffer row y
+ * touches, the yrel bits for each; overflow if one of them can't take n */
+#define RL_ROW(y, hi, n, p0, p1, y0, y1) \
+	int b_ = ((y) - 8) >> 3, r_ = ((y) - 8) & 7; \
+	u32 y0 = (u32)r_ << 9, y1 = (u32)((r_ - 8) & 15) << 9; \
+	u32 *p0 = rl_sink, *p1 = rl_sink; \
+	if ((unsigned)b_ < RL_BANDS) { \
+		p0 = rl_wp[2*b_ + (hi)]; \
+		if (p0 + (n) > rl.cmd[2*b_ + (hi)] + RL_CAP) { rl_ovf = 1; return; } \
+	} \
+	if (r_ && (unsigned)(b_ + 1) < RL_BANDS) { \
+		p1 = rl_wp[2*b_ + 2 + (hi)]; \
+		if (p1 + (n) > rl.cmd[2*b_ + 2 + (hi)] + RL_CAP) { rl_ovf = 1; return; } \
+	}
+#define RL_ROW_END(hi, p0, p1) \
+	if ((unsigned)b_ < RL_BANDS) rl_wp[2*b_ + (hi)] = p0; \
+	if (r_ && (unsigned)(b_ + 1) < RL_BANDS) rl_wp[2*b_ + 2 + (hi)] = p1;
+
+/* DrawLayerFull, as command lists */
+static void EmitLayer(int plane, int planestart, int planeend, struct PicoEState *est)
+{
+	struct PicoVideo *pvid = &est->Pico->video;
+	static const char shift[4] = {5,6,5,7};
+	const unsigned short *vram = est->PicoMem_vram;
+	int width, height, ymask, xmask, htab, nametab, hscroll = 0, vscroll, cells, trow;
+	int scrstart = est->Draw2Start, fb_end = 8 + (END_ROW-START_ROW)*8;
+	u32 xoff = (~est->rendstatus & (PDRAW_BORDER_32|PDRAW_32_COLS)) == 0 ? 32 : 0;
+
+	cells = (planeend>>16)-(planestart>>16);
+	planestart = planestart<<16>>16;
+	planeend = planeend<<16>>16;
+
+	htab = (pvid->reg[13]<<9) + plane;
+	if (!(pvid->reg[11]&3)) {      /* full screen scroll */
+		hscroll = vram[htab&0x7fff];
+		htab = 0;
+	}
+	width = pvid->reg[16];
+	height = (width>>4)&3; width &= 3;
+	xmask = (1<<shift[width])-1;
+	ymask = (height<<5)|0x1f;
+	if (width == 1)   ymask &= 0x3f;
+	else if (width>1) ymask = 0x1f;
+	if (plane==0) nametab = (pvid->reg[2]&0x38)<< 9; /* A */
+	else          nametab = (pvid->reg[4]&0x07)<<12; /* B */
+
+	vscroll = PicoMem.vsram[plane];
+	if ((pvid->reg[11]&4) || (vscroll&7))
+		planeend++;
+	for (trow = planestart; trow < planeend; trow++) {
+		int nametab_row = nametab + (((trow+(vscroll>>3))&ymask)<<shift[width]);
+		int y = 8*(trow - scrstart) + 8 - (vscroll&7);
+		int tilex, dx, cellc = cells;
+
+		if (htab) {
+			int htaddr = htab+(trow<<4);
+			if (trow) htaddr -= (vscroll&7)<<1;
+			hscroll = vram[htaddr&0x7fff];
+		}
+		if (y <= 0 || y >= fb_end)
+			continue;
+		tilex = (-hscroll)>>3;
+		dx = ((hscroll-1)&7)+1;
+		if (dx != 8) cellc++;
+		{
+			/* the (up to) two bands this tile row touches, lo and hi lists */
+			int b = (y - 8) >> 3, r = (y - 8) & 7;
+			u32 y0 = (u32)r << 9, y1 = (u32)((r - 8) & 15) << 9;
+			u32 *l0 = rl_sink, *h0 = rl_sink, *l1 = rl_sink, *h1 = rl_sink;
+			int v0 = (unsigned)b < RL_BANDS, v1 = r && (unsigned)(b + 1) < RL_BANDS;
+			if (v0) {
+				l0 = rl_wp[2*b]; h0 = rl_wp[2*b + 1];
+				if (l0 + cellc > rl.cmd[2*b] + RL_CAP || h0 + cellc > rl.cmd[2*b + 1] + RL_CAP)
+					{ rl_ovf = 1; return; }
+			}
+			if (v1) {
+				l1 = rl_wp[2*b + 2]; h1 = rl_wp[2*b + 3];
+				if (l1 + cellc > rl.cmd[2*b + 2] + RL_CAP || h1 + cellc > rl.cmd[2*b + 3] + RL_CAP)
+					{ rl_ovf = 1; return; }
+			}
+			for (; cellc; dx += 8, tilex++, cellc--) {
+				u32 code = vram[nametab_row + (tilex&xmask)];
+				u32 c = (xoff + dx) | (code & 0x7fff) << 13;
+				if (code & 0x8000) { *h0++ = c | y0; *h1++ = c | y1; }
+				else               { *l0++ = c | y0; *l1++ = c | y1; }
+			}
+			if (v0) { rl_wp[2*b] = l0; rl_wp[2*b + 1] = h0; }
+			if (v1) { rl_wp[2*b + 2] = l1; rl_wp[2*b + 3] = h1; }
+		}
+	}
+}
+
+/* DrawWindowFull (both priority passes), as command lists */
+static void EmitWindow(int start, int end, struct PicoEState *est)
+{
+	struct PicoVideo *pvid = &est->Pico->video;
+	const unsigned short *vram = est->PicoMem_vram;
+	int nametab, nametab_step, trow, tilex, hi;
+	int scrstart = est->Draw2Start;
+	int tile_start = start>>16, tile_end = end>>16;
+	u32 xoff = 8;
+
+	start = start<<16>>16;
+	end = end<<16>>16;
+	if (!(est->rendstatus & PDRAW_32_COLS)) {
+		nametab = (pvid->reg[3]&0x3c)<<9; /* 40-cell mode */
+		nametab_step = 1<<6;
+	} else {
+		nametab = (pvid->reg[3]&0x3e)<<9; /* 32-cell mode */
+		nametab_step = 1<<5;
+		if (est->rendstatus & PDRAW_BORDER_32)
+			xoff += 32;
+	}
+	nametab += nametab_step*(start-scrstart);
+	/* the whole window is drawn in the pass of its first tile's priority */
+	hi = vram[nametab+tile_start] >> 15;
+
+	for (trow = start; trow < end; trow++, nametab += nametab_step) {
+		int b = trow - scrstart, i = 2*b + hi;   /* tile rows are band aligned */
+		u32 *p;
+		if ((unsigned)b >= RL_BANDS)
+			continue;
+		p = rl_wp[i];
+		if (p + (tile_end - tile_start) > rl.cmd[i] + RL_CAP) { rl_ovf = 1; return; }
+		for (tilex = tile_start; tilex < tile_end; tilex++)
+			*p++ = (xoff + (tilex<<3)) | (u32)(vram[nametab+tilex] & 0x7fff) << 13;
+		rl_wp[i] = p;
+	}
+}
+
+/* DrawSpriteFull, as command lists */
+static void EmitSprite(u32 *sprite, int hi, struct PicoEState *est)
+{
+	int width, height, tile, code, tdeltax, tdeltay, sx, sy;
+	int scrstart = est->Draw2Start;
+	u32 xoff = (~est->rendstatus & (PDRAW_BORDER_32|PDRAW_32_COLS)) == 0 ? 32 : 0;
+	u32 cbits;
+
+	sy = CPU_LE2(sprite[0]);
+	height = sy>>24;
+	sy = (sy&0x1ff)-0x78; /* Y */
+	width = (height>>2)&3; height &= 3;
+	width++; height++;    /* width and height in tiles */
+
+	code = CPU_LE2(sprite[1]);
+	sx = ((code>>16)&0x1ff)-0x78; /* X */
+	cbits = (u32)(code & 0x7800) << 13;   /* flips, palette */
+
+	tile = code&0x7ff;
+	tdeltax = height;
+	tdeltay = 1;
+	if (code&0x1000) { tile+=tdeltax-1; tdeltay=-tdeltay; } /* flip Y */
+	if (code&0x0800) { tile+=tdeltax*(width-1); tdeltax=-tdeltax; } /* flip X */
+
+	sy -= scrstart*8;
+	while (sy <= 0) { sy+=8; tile+=tdeltay; height--; }
+
+	for (; height > 0; height--, sy+=8, tile+=tdeltay) {
+		int w = width, x = sx, t = tile;
+		if (sy >= END_ROW*8+8) return; /* offscreen */
+		{
+			RL_ROW(sy, hi, 4, p0, p1, y0, y1)
+			for (; w; w--, x+=8, t+=tdeltax) {
+				u32 c;
+				if (x<=0)   continue;
+				if (x>=328) break;
+				c = (xoff + x) | (u32)(t & 0x7ff) << 13 | cbits;
+				*p0++ = c | y0;
+				*p1++ = c | y1;
+			}
+			RL_ROW_END(hi, p0, p1)
+		}
+	}
+}
+
+/* DrawDisplayFull's layer sequence as RSP command lists, then queue the
+ * render.  Returns 0 if a list overflowed (nothing queued). */
+static int EmitDisplayRSP(int hvwin, int planestart, int planeend, int winstart,
+                          int winend, int scrstart, int scrend, int maxw, int maxcolc)
+{
+	struct PicoEState *est = &Pico.est;
+	struct PicoVideo *pvid = &est->Pico->video;
+	u32 *spr[80];
+	int i, n;
+
+	/* the RSP copies VRAM while the lists are built */
+	rsp_vdp_snapshot(est->PicoMem_vram);
+	for (i = 0; i < RL_BANDS * 2; i++)
+		rl_wp[i] = rl.cmd[i];
+	rl_ovf = 0;
+
+	if (!(pvid->debug_p & PVD_KILL_B))
+		EmitLayer(1, scrstart, (maxcolc<<16)|scrend, est);
+	if (!(pvid->debug_p & PVD_KILL_A)) switch (hvwin) {
+		case 4: /* fullscreen window */
+			EmitWindow(scrstart, (maxcolc<<16)|scrend, est);
+			break;
+		case 3: /* plane A and both v and h windows */
+			EmitLayer(0, planestart, planeend, est);
+			EmitWindow( winstart&~0xff0000, (winend&~0xff0000)|(maxcolc<<16), est); /* h */
+			EmitWindow((winstart&~0xff)|scrstart, (winend&~0xff)|scrend, est);    /* v */
+			break;
+		case 2:
+		case 1: /* window vertical XOR horizontal */
+			EmitLayer(0, planestart, planeend, est);
+			EmitWindow(winstart, winend, est);
+			break;
+		default: /* fullscreen plane A */
+			EmitLayer(0, scrstart, (maxcolc<<16)|scrend, est);
+			break;
+	}
+	n = (pvid->debug_p & PVD_KILL_S_LO) ? 0 : CollectSpritesFull(0, maxw, est, spr);
+	while (n > 0)
+		EmitSprite(spr[--n], 0, est);
+	n = (pvid->debug_p & PVD_KILL_S_HI) ? 0 : CollectSpritesFull(1, maxw, est, spr);
+	while (n > 0)
+		EmitSprite(spr[--n], 1, est);
+	if (rl_ovf)
+		return 0;
+
+	for (i = 0; i < RL_BANDS * 2; i++) {
+		n = rl_wp[i] - rl.cmd[i];
+		rl.cnt[i] = n;
+		if (n) {
+			data_cache_hit_writeback(rl.cmd[i], n * 4);
+			if ((unsigned)n > draw2_rsp_maxlist) draw2_rsp_maxlist = n;
+		}
+	}
+	data_cache_hit_writeback(rl.cnt, sizeof(rl.cnt));
+	/* the RSP writes framebuffer rows 8.. by DMA: no dirty CPU copy of them
+	 * (from a frame drawn on the CPU) may be written back over its output
+	 * later.  Normally there is none: the platform wrote that frame back
+	 * to display it. */
+	if (draw2_fb_dirty) {
+		data_cache_hit_writeback_invalidate(est->Draw2FB, (8 + RL_BANDS * 8 + 8) * est->Draw2Width);
+		draw2_fb_dirty = 0;
+	}
+	rsp_vdp_render(&rl, RL_BANDS, pvid->reg[7], est->Draw2FB + 8 * est->Draw2Width + 8);
+	rsp_took = 1;
+#ifdef RSP_VDP_SYNC
+	rsp_vdp_wait();
+#endif
+	return 1;
+}
+#endif /* N64_RSP_VDP */
+
 #ifndef _ASM_DRAW_C
 static void BackFillRows(unsigned char *dst, int reg7, int lwidth, int y0, int y1)
 {
@@ -850,19 +1109,20 @@ static void DrawDisplayFull(void)
 
 	if (hvwin==1) { winend|=maxcolc<<16; planeend|=maxcolc<<16; }
 
+#ifdef N64_RSP_VDP
+	if (draw2_rsp) {
+		if (EmitDisplayRSP(hvwin, planestart, planeend, winstart, winend,
+		                   scrstart, scrend, maxw, maxcolc))
+			return;
+		draw2_rsp_ovf++;   /* lists full: draw this frame on the CPU */
+	}
+#endif
+
 #if BANDED
 	u32 *spr_lo[80], *spr_hi[80];
 	int n_lo = (pvid->debug_p & PVD_KILL_S_LO) ? 0 : CollectSpritesFull(0, maxw, est, spr_lo);
 	int n_hi = (pvid->debug_p & PVD_KILL_S_HI) ? 0 : CollectSpritesFull(1, maxw, est, spr_hi);
 	int band_y, fb_end = 8 + (END_ROW-START_ROW)*8, band_h = DRAW2_BAND;
-#ifdef N64_RSP_VDP
-	u32 *rsp_hdr = 0;
-	draw2_emit = draw2_rsp;
-	if (draw2_emit) {
-		band_h = 8;
-		rsp_cmdp = rsp_stream;
-	}
-#endif
 	for (band_y = 8; band_y < fb_end; band_y += band_h) {
 	int band_y1 = band_y + band_h < fb_end ? band_y + band_h : fb_end;
 	int si;
@@ -870,11 +1130,6 @@ static void DrawDisplayFull(void)
 	clip_hi = est->Draw2FB + band_y1 * est->Draw2Width;
 	band_r0 = band_y;
 	band_r1 = band_y1;
-#ifdef N64_RSP_VDP
-	if (draw2_emit)
-		rsp_hdr = rsp_cmdp++;
-	else
-#endif
 	BackFillRows(est->Draw2FB, pvid->reg[7], est->Draw2Width, band_y, band_y1);
 #endif
 	HighCache2A[0] = HighCache2B[0] = 0;
@@ -943,25 +1198,7 @@ static void DrawDisplayFull(void)
 	for (si = n_hi - 1; si >= 0; si--)
 		DrawSpriteFull(spr_hi[si], est);
 	PROF2_SPR();
-#ifdef N64_RSP_VDP
-	if (draw2_emit)
-		*rsp_hdr = (u32)(rsp_cmdp - rsp_hdr - 1) | (u32)(pvid->reg[7] & 0x3f) << 16;
-#endif
 	}  /* band loop */
-#ifdef N64_RSP_VDP
-	if (draw2_emit) {
-		/* the RSP writes framebuffer rows 8..fb_end-1 by DMA: no dirty
-		 * CPU copy of them may be written back over its output later */
-		data_cache_hit_writeback_invalidate(est->Draw2FB + 8 * est->Draw2Width,
-		                                    (fb_end - 8) * est->Draw2Width);
-		rsp_vdp_render(rsp_stream, rsp_cmdp - rsp_stream, (fb_end - 8) / 8,
-		               est->Draw2FB + 8 * est->Draw2Width + 8, est->PicoMem_vram);
-#ifdef RSP_VDP_SYNC
-		rsp_vdp_wait();
-#endif
-		draw2_emit = 0;
-	}
-#endif
 	clip_lo = (unsigned char *)0;
 	clip_hi = (unsigned char *)~(uintptr_t)0;
 	band_r0 = 0;
@@ -983,6 +1220,9 @@ PICO_INTERNAL void PicoFrameFull(void)
 
 	// prepare cram?
 	if (PicoPrepareCram) PicoPrepareCram();
+#ifdef N64_RSP_VDP
+	rsp_took = 0;
+#endif
 
 	// Draw screen:
 #if BANDED
@@ -1019,6 +1259,12 @@ PICO_INTERNAL void PicoFrameFull(void)
 					n++; reported++;
 				}
 	}
+#endif
+#ifdef N64_RSP_VDP
+	if (!rsp_took)
+		draw2_fb_dirty = 1;
+	if (Pico.est.rendstatus & PDRAW_30_ROWS)
+		draw2_fb_dirty = 1;
 #endif
 	// clear top and bottom 8 lines in 240 mode, since draw2 only does 224
 	if (Pico.est.rendstatus & PDRAW_30_ROWS) {

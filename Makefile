@@ -297,10 +297,10 @@ N64_ORDER_FILE ?= $(if $(wildcard platform/n64/layouts/$(N64_ROM_ID).ld),platfor
 ifeq "$(N64_HOT_ORDER)" "1"
 LDFLAGS += -Wl,--section-ordering-file=$(N64_ORDER_FILE)
 endif
-# Exact native fast-forward of the embedded game's Z80 sound-driver main
-# loop (cpu/cz80/cz80.c, z80_driver_accel).  Only engages when Z80 RAM holds
-# that exact code; results are identical to plain Cz80.  Disable with
-# N64_Z80_ACCEL=0.
+# Exact native fast-forward of known Z80 sound-driver main loops (Gley
+# Lancer, Lightening Force; cpu/cz80/cz80.c z80_driver_accel*).  Only
+# engages when Z80 RAM holds that exact code; results are identical to
+# plain Cz80.  Disable with N64_Z80_ACCEL=0.
 # Benchmark/trace support is always compiled in and only runs from a dev ROM
 # (platform/n64/tools/make_dev_rom.sh), so dev and release ROMs share code
 # and code layout.

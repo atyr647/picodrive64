@@ -2,22 +2,25 @@
 # RSP tile renderer (draw2 backend)
 #
 # The CPU (pico/draw2.c, emit mode) walks the planes, window and sprites
-# exactly as the CPU renderer does, band by band, and instead of drawing a
-# tile it emits one command word per (tile, 8-line band).  This overlay
-# draws those commands into an 8-line band buffer in DMEM and DMAs each
-# finished band into the CI8 framebuffer, so the pixel work runs here while
-# the CPU goes on emulating.  Per pixel it does what draw2's put8() does:
+# once per frame and, instead of drawing a tile, appends one command word
+# per (tile, 8-line band) to that band's lists.  This overlay draws those
+# commands into an 8-line band buffer in DMEM and DMAs each finished band
+# into the CI8 framebuffer, so the pixel work runs here while the CPU goes
+# on emulating.  Per pixel it does what draw2's put8() does:
 # nibble 0 is transparent, others become (pal | nibble).
 #
-# Command stream (RDRAM, read in 256-byte chunks), per band:
-#   header: bits 0-15 number of commands, bits 16-21 backfill colour
+# Command lists (RDRAM, struct rsp_lists in draw2.c): 64 halfword counts
+# (128 bytes, [band*2 + hi]), then per band a "lo" and a "hi" list of
+# LIST_BYTES each.  A band draws its lo list, then its hi list.
 #   command: bits 0-8   x: framebuffer column of the tile's left pixel
 #            bits 9-12  yrel: tile top row relative to band top (-7..7)
 #            bits 13-23 tile index (VRAM byte address = index * 32)
-#            bits 24-25 palette (pixel = pal << 4 | nibble)
-#            bit  26    x flip, bit 27 y flip
+#            bit  24    x flip, bit 25 y flip
+#            bits 26-27 palette (pixel = pal << 4 | nibble)
+#            (bits 13-27 are bits 0-14 of the VDP name / sprite code)
 #
-# cmd_vdp_render: a0 = number of bands, a1 = command stream (RDRAM),
+# cmd_vdp_render: a0 = number of bands | backfill colour << 16,
+#                 a1 = command lists (RDRAM),
 #                 a2 = framebuffer address of band 0, row 0, column 8,
 #                 a3 = VRAM base (RDRAM, written back by the CPU)
 ##############################################################################
@@ -26,6 +29,7 @@
 
 #define BW      344             /* band buffer row width (tiles may reach x+7 = 343) */
 #define FBW     328             /* framebuffer row pitch */
+#define LIST_BYTES 2048         /* RL_CAP * 4 in draw2.c */
 
     .data
 
@@ -47,6 +51,10 @@ band:       .space 8*BW
     .align 3
 cmdbuf:     .space 256
     .align 3
+cnts:       .space 128
+bfill:      .word 0
+lbase:      .word 0
+    .align 3
 tilebuf:    .space 32
 
     .text
@@ -56,23 +64,32 @@ tilebuf:    .space 32
     #   v0 = return to rspq          s7 = next command chunk (RDRAM)
     #   s6 = framebuffer, band row 0  s5 = VRAM base (RDRAM)
     #   s3/s2 = command chunk read pointer / end (DMEM)
-    #   s1 = commands left in band    k1 = bands left
+    #   s1 = commands left in list    k1 = bands left
+    #   sp = count of the current list (DMEM, cnts + 2 * (band*2 + hi))
     #   k0 = 0x00FF00FF   fp = 0x0F0F0F0F   v1 = 0x01010101
     #   per command: a0 cmd, a1 dst, a2 pal x4, a3 rows left,
     #                t3 src row, t4 src step, s0/s4/t0/t1/t2/at for DMA
     ##########################################################################
 
-    # next command-stream word -> reg (refills the 256-byte chunk)
+    # next command of the list -> reg; refills cmdbuf with the next
+    # min(256, rest of the list) bytes (s1 = commands left, this one included)
     .macro GETWORD reg
         bne     s3, s2, 1f
+        sll     t0, s1, 2
+        addiu   t0, t0, 7
+        srl     t0, t0, 3
+        sll     t0, t0, 3               # rest of the list, 8-byte multiple
+        slti    t9, t0, 257
+        bnez    t9, 2f
         nop
-        move    s0, s7
+        li      t0, 256
+2:      move    s0, s7
+        addu    s7, s7, t0
         li      s4, %lo(cmdbuf)
+        addiu   s2, t0, %lo(cmdbuf)
         jal     DMAIn
-        li      t0, DMA_SIZE(256, 1)
-        addiu   s7, s7, 256
+        addiu   t0, t0, -1              # DMA_SIZE(bytes, 1)
         li      s3, %lo(cmdbuf)
-        li      s2, %lo(cmdbuf) + 256
 1:      lw      \reg, 0(s3)
         addiu   s3, s3, 4
     .endm
@@ -111,11 +128,22 @@ tilebuf:    .space 32
 cmd_vdp_render:
     move    v0, ra
     andi    k1, a0, 0xFFFF
-    move    s7, a1
+    srl     t7, a0, 16
+    andi    t7, t7, 0x3F
+    sll     t8, t7, 8
+    or      t7, t7, t8
+    sll     t8, t7, 16
+    or      t7, t7, t8              # backfill colour x4
+    sw      t7, %lo(bfill)
+    addiu   t8, a1, 128
+    sw      t8, %lo(lbase)          # band 0's lo list
     move    s6, a2
     move    s5, a3
-    li      s3, 0
-    li      s2, 0
+    move    s0, a1
+    li      s4, %lo(cnts)
+    jal     DMAIn
+    li      t0, DMA_SIZE(128, 1)
+    li      sp, %lo(cnts)
     li      k0, 0x00FF00FF
     li      fp, 0x0F0F0F0F
     li      v1, 0x01010101
@@ -123,16 +151,9 @@ cmd_vdp_render:
 band_loop:
     beqz    k1, render_done
     nop
-    GETWORD t9
-    andi    s1, t9, 0xFFFF
-    srl     t7, t9, 16
-    andi    t7, t7, 0x3F
-    sll     t8, t7, 8
-    or      t7, t7, t8
-    sll     t8, t7, 16
-    or      t7, t7, t8              # backfill colour x4
     jal     DMAWaitIdle             # previous band's output DMA done?
     nop
+    lw      t7, %lo(bfill)
     li      t3, %lo(band)
     li      t4, %lo(band) + 8*BW
 fill_loop:
@@ -147,8 +168,18 @@ fill_loop:
     bne     t3, t4, fill_loop
     sw      t7, -4(t3)
 
+list_start:
+    lhu     s1, 0(sp)
+    lw      t8, %lo(lbase)
+    li      t9, %lo(cnts)
+    subu    t9, sp, t9
+    sll     t9, t9, 10              # (index * 2) * LIST_BYTES / 2
+    addu    s7, t8, t9
+    li      s3, 0
+    li      s2, 0
+
 cmd_loop:
-    beqz    s1, band_out
+    beqz    s1, list_end
     nop
     GETWORD a0
     addiu   s1, s1, -1
@@ -163,7 +194,7 @@ cmd_loop:
     li      t0, DMA_SIZE(32, 1)
 
     /* palette x4 */
-    srl     a2, a0, 20
+    srl     a2, a0, 22
     andi    a2, a2, 0x30
     sll     t8, a2, 8
     or      a2, a2, t8
@@ -196,7 +227,7 @@ cmd_loop:
     addiu   a1, a1, %lo(band)
     /* src: y flip walks the tile bottom-up */
     sll     t8, t6, 2
-    srl     t9, a0, 27
+    srl     t9, a0, 25
     andi    t9, t9, 1
     bnez    t9, 4f
     li      t4, 4
@@ -206,7 +237,7 @@ cmd_loop:
     li      t3, %lo(tilebuf) + 28
     subu    t3, t3, t8
 5:
-    srl     t9, a0, 26
+    srl     t9, a0, 24
     andi    t9, t9, 1               # x flip
     move    s0, t9
 
@@ -239,6 +270,12 @@ row_next:
     bnez    a3, row_loop
     addiu   a1, a1, BW
     b       cmd_loop
+    nop
+
+list_end:
+    addiu   sp, sp, 2
+    andi    t9, sp, 2               # lo list done -> the band's hi list
+    bnez    t9, list_start
     nop
 
 band_out:

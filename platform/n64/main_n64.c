@@ -240,16 +240,16 @@ int emux_in68k;
 unsigned int emux_fame_calls, emux_fame_instrs;
 #endif
 #ifdef FAME_PCHIST
-unsigned int m68k_pchist[0x88000];
+unsigned int m68k_pchist[0x44000];   /* 4-byte buckets: ROM 1MB, RAM 64KB */
 static void m68k_pchist_dump(void)
 {
 	unsigned long long tot = 0;
-	for (int i = 0; i < 0x88000; i++) tot += m68k_pchist[i];
+	for (int i = 0; i < 0x44000; i++) tot += m68k_pchist[i];
 	unsigned int thr = (unsigned int)(tot / 2000);
 	debugf("[MHBEGIN] total=%llu thr=%u\n", tot, thr);
-	for (int i = 0; i < 0x88000; i++)
+	for (int i = 0; i < 0x44000; i++)
 		if (m68k_pchist[i] > thr)
-			debugf("[MH] %06x %u\n", i < 0x80000 ? i * 2 : 0xff0000 + (i - 0x80000) * 2, m68k_pchist[i]);
+			debugf("[MH] %06x %u\n", i < 0x40000 ? i * 4 : 0xff0000 + (i - 0x40000) * 4, m68k_pchist[i]);
 	debugf("[MHEND]\n");
 }
 #endif
@@ -843,8 +843,19 @@ int main(int argc, char *argv[])
 					bench_fb_n++;
 				}
 #endif
-				unsigned wb_bytes = (SCR_PITCH * h + 15) & ~15;
+				/* the RDP reads rows 8..8+h: write back what the CPU drew
+				 * (with the RSP renderer usually nothing: it DMAs rows) */
+				unsigned wb_rows = 8 + h < 240 ? 8 + h : 240;
+				unsigned wb_bytes = (SCR_PITCH * wb_rows + 15) & ~15;
+#ifdef N64_RSP_VDP
+				{ extern int draw2_fb_dirty;
+				if (draw2_fb_dirty) {
+					data_cache_hit_writeback(screen_buffer, wb_bytes);
+					draw2_fb_dirty = 0;
+				} }
+#else
 				data_cache_hit_writeback(screen_buffer, wb_bytes);
+#endif
 				data_cache_hit_writeback(pal_rgba5551, sizeof(pal_rgba5551));
 
 				/* draw2.c (alt renderer) writes into buffer starting at
@@ -858,12 +869,31 @@ int main(int argc, char *argv[])
 					screen_buffer + 8*SCR_PITCH + 8,
 					FMT_CI8, w, h, SCR_PITCH);
 
+				/* The blit is the same every frame (same source, palette
+				 * and geometry), so it is recorded once as an rspq block
+				 * and each frame queues a single call.  Written out every
+				 * frame, its ~700 words of rdpq commands overflowed rspq's
+				 * 2 x 2KB command ring while the RSP was still busy with
+				 * this frame's tile render, and the CPU sat waiting for
+				 * the render to finish. */
+				static rspq_block_t *blit_block;
+				static int blit_w, blit_h, blit_y;
+				if (!blit_block || w != blit_w || h != blit_h || y_off != blit_y) {
+					if (blit_block) {
+						rspq_wait();   /* not in use any more */
+						rspq_block_free(blit_block);
+					}
+					rspq_block_begin();
+					rdpq_set_mode_standard();
+					rdpq_mode_filter(FILTER_POINT);
+					rdpq_mode_tlut(TLUT_RGBA16);
+					rdpq_tex_upload_tlut(pal_rgba5551, 0, 256);
+					rdpq_tex_blit(&ci8_surf, 0, y_off, NULL);
+					blit_block = rspq_block_end();
+					blit_w = w; blit_h = h; blit_y = y_off;
+				}
 				rdpq_attach(fb, NULL);
-				rdpq_set_mode_standard();
-				rdpq_mode_filter(FILTER_POINT);
-				rdpq_mode_tlut(TLUT_RGBA16);
-				rdpq_tex_upload_tlut(pal_rgba5551, 0, 256);
-				rdpq_tex_blit(&ci8_surf, 0, y_off, NULL);
+				rspq_block_run(blit_block);
 
 #ifdef RDP_TILES_DEMO
 				{
@@ -1022,7 +1052,7 @@ post_render: ;
 					zh = bench_hash(t, sizeof(t), zh);
 					debugf("[ZSTATE] zhash=%08lx\n", (unsigned long)zh);
 #ifdef N64_RSP_VDP
-					{ extern unsigned int rsp_vdp_stat[4]; debugf("[RSPVDP] renders=%u blocked=%u waited=%lu us total, copy waits %lu us\n", rsp_vdp_stat[2], rsp_vdp_stat[0], (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[1]), (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[3])); }
+					{ extern unsigned int rsp_vdp_stat[4], draw2_rsp_ovf, draw2_rsp_maxlist; debugf("[RSPVDP] renders=%u blocked=%u waited=%lu us total, copy waits %lu us, cpu frames %u, longest list %u\n", rsp_vdp_stat[2], rsp_vdp_stat[0], (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[1]), (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[3]), draw2_rsp_ovf, draw2_rsp_maxlist); }
 #endif
 				}
 				uint32_t h = bench_hash(PicoMem.ram, 0x10000, 2166136261u);

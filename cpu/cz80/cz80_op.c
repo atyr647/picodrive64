@@ -139,6 +139,25 @@ OP_LOAD_A_mxx:
 		RET(7)
 
 	OP(0x3a):   // LD   A,(nn)
+#if PICODRIVE_HACKS && defined(Z80_DRIVER_ACCEL)
+		/* both known driver idle loops start with this opcode: check
+		 * for them only here, not on every instruction (cz80.c) */
+		{
+			uptr off_ = (uptr)(PC - 1) - (uptr)CPU->Fetch[0];
+			if (off_ == 0x23 || off_ == 0xcb)
+			{
+				INT32 npc;
+				zR--;	/* as before this opcode's fetch */
+				npc = off_ == 0x23 ? z80_driver_accel(CPU) : z80_driver_accel_tf4(CPU);
+				if (npc >= 0)
+				{
+					SET_PC(npc);
+					goto Cz80_Exec;
+				}
+				zR++;
+			}
+		}
+#endif
 OP_LOAD_A_mNN:
 		adr = READ_ARG16();
 		zA = READ_MEM8(adr);

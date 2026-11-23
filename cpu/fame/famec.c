@@ -256,11 +256,11 @@
 #else
 
 #ifdef FAME_PCHIST
-/* profiling builds only: count executed instructions per 68k word address
- * (ROM 0-1MB, then 64KB RAM) -- see main_n64.c */
+/* profiling builds only: count executed instructions per 4-byte 68k
+ * address bucket (ROM 0-1MB, then 64KB RAM) -- see main_n64.c */
 extern unsigned int m68k_pchist[];
 #define FAME_PCHIST_HOOK { u32 pc_ = (u32)((uintptr_t)PC - (uintptr_t)BasePC) & 0xffffff; \
-    m68k_pchist[pc_ < 0x100000 ? (pc_ >> 1) : 0x80000 + ((pc_ & 0xffff) >> 1)]++; }
+    m68k_pchist[pc_ < 0x100000 ? (pc_ >> 2) : 0x40000 + ((pc_ & 0xffff) >> 2)]++; }
 #elif defined(N64_EMUX_ICOUNT)
 extern unsigned int emux_fame_instrs;
 #define FAME_PCHIST_HOOK emux_fame_instrs++;

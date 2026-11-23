@@ -1421,6 +1421,21 @@ int ym2612_timer_b_flag_from(void)
   return Pico.t.timer_b_next_oflow;
 }
 
+/* The same for the timer flags in mask (1 = A, 2 = B): the first cycle at
+ * which a status read returns one of them set; 0 if one already is,
+ * 0x7fffffff if none can be. */
+int ym2612_timer_flag_from(int mask)
+{
+  int t = 0x7fffffff, en = (ym2612.OPN.ST.mode >> 2) & mask;
+  if (ym2612.OPN.ST.status & mask)
+    return 0;
+  if ((en & 1) && Pico.t.timer_a_next_oflow < t)
+    t = Pico.t.timer_a_next_oflow;
+  if ((en & 2) && Pico.t.timer_b_next_oflow < t)
+    t = Pico.t.timer_b_next_oflow;
+  return t;
+}
+
 static u32 ym2612_read_local_z80(void)
 {
   int xcycles = z80_cyclesDone() << 8;
