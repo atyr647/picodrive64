@@ -210,6 +210,7 @@ static void blit_done(void *fb)
 #endif
 
 uint32_t bench_audio_hash = 2166136261u; unsigned int bench_audio_n;
+static char bench_res[9][44];   /* result screen lines (dev ROM) */
 uint32_t bench_fb_hash = 2166136261u; unsigned int bench_fb_n;
 unsigned int bench_z80_ticks, bench_z80_calls, bench_fmwait_ticks, bench_blitwait_ticks, bench_fmwait_skip;
 
@@ -1051,6 +1052,7 @@ post_render: ;
 						ym2612.OPN.ST.status, ym2612.dacout };
 					zh = bench_hash(t, sizeof(t), zh);
 					debugf("[ZSTATE] zhash=%08lx\n", (unsigned long)zh);
+					snprintf(bench_res[3], sizeof(bench_res[3]), "zhash   %08lx", (unsigned long)zh);
 #ifdef N64_RSP_VDP
 					{ extern unsigned int rsp_vdp_stat[4], draw2_rsp_ovf, draw2_rsp_maxlist; debugf("[RSPVDP] renders=%u blocked=%u waited=%lu us total, copy waits %lu us, cpu frames %u, longest list %u\n", rsp_vdp_stat[2], rsp_vdp_stat[0], (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[1]), (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[3]), draw2_rsp_ovf, draw2_rsp_maxlist); }
 #endif
@@ -1073,6 +1075,33 @@ post_render: ;
 					(unsigned int)(TIMER_MICROS_LL(bench_fmwait_ticks - fw0) / b_frames),
 					(unsigned int)(TIMER_MICROS_LL(bench_fmwait_skip - fs0) / b_frames),
 					(unsigned int)(TIMER_MICROS_LL(bench_blitwait_ticks - bw0) / b_frames));
+				snprintf(bench_res[0], sizeof(bench_res[0]), "frames %u-%u  %s", bench_start, bench_end, EMBEDDED_ROM_NAME);
+				snprintf(bench_res[1], sizeof(bench_res[1]), "us/frame %u  speed %u.%u%%", us,
+					(16666670u / us) / 10, (16666670u / us) % 10);
+				snprintf(bench_res[2], sizeof(bench_res[2]), "ramhash %08lx", (unsigned long)h);
+				snprintf(bench_res[4], sizeof(bench_res[4]), "audio   %08lx (%u smp)", (unsigned long)bench_audio_hash, bench_audio_n);
+#ifdef N64_RSP_VDP
+				{ extern unsigned int rsp_vdp_stat[4], draw2_rsp_ovf, draw2_rsp_maxlist;
+				snprintf(bench_res[5], sizeof(bench_res[5]), "rsp renders %u blocked %u", rsp_vdp_stat[2], rsp_vdp_stat[0]);
+				snprintf(bench_res[6], sizeof(bench_res[6]), "rsp waited %lu us copy %lu us",
+					(unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[1]), (unsigned long)TIMER_MICROS_LL(rsp_vdp_stat[3]));
+				snprintf(bench_res[7], sizeof(bench_res[7]), "cpu frames %u  longest list %u", draw2_rsp_ovf, draw2_rsp_maxlist); }
+#endif
+				snprintf(bench_res[8], sizeof(bench_res[8]), "blitwait %u us/frame",
+					(unsigned int)(TIMER_MICROS_LL(bench_blitwait_ticks - bw0) / b_frames));
+			}
+			if (f == bench_end + 1) {
+				/* dev ROM: the run is over.  Leave the results on screen
+				 * (for a photo from real hardware) and stop. */
+				rspq_wait();
+				for (;;) {
+					surface_t *d = display_get();
+					graphics_fill_screen(d, 0);
+					graphics_draw_text(d, 16, 24, "PicoDrive64 bench  rev" REVISION);
+					for (int i = 0; i < 9; i++)
+						graphics_draw_text(d, 16, 48 + 16 * i, bench_res[i]);
+					display_show(d);
+				}
 			}
 		}
 #endif
